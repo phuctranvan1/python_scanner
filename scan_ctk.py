@@ -426,90 +426,159 @@ def preprocess_image(img):
 
     h, w = gray.shape
 
-    # Upscale nhẹ nếu ảnh nhỏ (screenshot điện thoại thường >= 1000px nên skip)
-    if w < 800:
-        scale = 2
+    # Upscale if image is small — higher threshold (1200px) catches more cases
+    # Use scale=3 for very small images for better OCR quality
+    if w < 1200:
+        scale = 3 if w < 600 else 2
         gray = cv2.resize(gray, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4)
 
     # Phân tích độ sáng trung bình để phát hiện nền tối / sáng
     mean_brightness = np.mean(gray)
 
     if mean_brightness > 180:
-        # Ảnh sáng (screenshot điện thoại nền trắng): chỉ cần sharpen nhẹ
-        # Không dùng CLAHE mạnh vì sẽ làm nhiễu nền trắng
-        kernel = np.array([[0, -0.5, 0],
-                            [-0.5, 3, -0.5],
-                            [0, -0.5, 0]])
+        # Ảnh sáng (screenshot điện thoại nền trắng): sharpen để tăng độ nét chữ
+        kernel = np.array([[ 0, -1,  0],
+                            [-1,  5, -1],
+                            [ 0, -1,  0]], dtype=np.float32)
         enhanced = cv2.filter2D(gray, -1, kernel)
         enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+        # Light denoising to remove scanner/compression artifacts
+        enhanced = cv2.fastNlMeansDenoising(enhanced, h=5, templateWindowSize=7, searchWindowSize=21)
     else:
         # Ảnh tối / scan thật: dùng CLAHE để tăng tương phản
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
-        enhanced = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
+        enhanced = cv2.bilateralFilter(enhanced, d=7, sigmaColor=75, sigmaSpace=75)
 
-    # Binarize nhẹ: ngưỡng adaptive để tách chữ khỏi nền không đều
-    # blockSize phải lẻ, chọn giá trị đủ lớn để không bị ảnh hưởng bởi shadow
+    # Binarize: ngưỡng adaptive Gaussian để tách chữ khỏi nền không đều
+    # blockSize nhỏ hơn (21) bắt được nét chữ nhỏ tốt hơn; C=8 ít agressive hơn
     binary = cv2.adaptiveThreshold(
         enhanced, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        blockSize=31,
-        C=10
+        blockSize=21,
+        C=8
     )
+
+    # Morphological opening with a 2×2 kernel to remove isolated noise pixels
+    # without breaking connected character strokes
+    kernel_morph = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_morph)
 
     return Image.fromarray(binary)
 
 
 def preprocess_for_easyocr(img):
-    """Preprocessing riêng cho EasyOCR: giữ màu xám (không binarize) để
-    EasyOCR tự học features tốt hơn."""
+    """Preprocessing riêng cho EasyOCR: giữ ảnh màu (RGB) và tăng tương phản.
+    EasyOCR được huấn luyện trên ảnh màu nên cho kết quả tốt hơn grayscale."""
     open_cv_image = np.array(img)
+
+    # Keep colour — convert to BGR for OpenCV processing
     if len(open_cv_image.shape) == 3:
-        gray = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2GRAY)
+        bgr = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
     else:
-        gray = open_cv_image.copy()
+        bgr = cv2.cvtColor(open_cv_image, cv2.COLOR_GRAY2BGR)
 
-    h, w = gray.shape
-    if w < 800:
-        gray = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_LANCZOS4)
+    h, w = bgr.shape[:2]
 
+    # Upscale small images — same threshold as Tesseract pipeline
+    if w < 1200:
+        scale = 3 if w < 600 else 2
+        bgr = cv2.resize(bgr, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4)
+
+    # Use grayscale only for brightness analysis
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     mean_brightness = np.mean(gray)
-    if mean_brightness > 180:
-        kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
-        enhanced = cv2.filter2D(gray, -1, kernel)
-        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
-    else:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
 
-    return Image.fromarray(enhanced)
+    if mean_brightness > 180:
+        # Light image: gentle unsharp-mask style sharpening on the colour image
+        kernel = np.array([[ 0, -1,  0],
+                            [-1,  5, -1],
+                            [ 0, -1,  0]], dtype=np.float32)
+        bgr = cv2.filter2D(bgr, -1, kernel)
+        bgr = np.clip(bgr, 0, 255).astype(np.uint8)
+    else:
+        # Dark/scanned image: enhance contrast via CLAHE on the L channel (LAB space)
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l_ch = clahe.apply(l_ch)
+        lab = cv2.merge([l_ch, a_ch, b_ch])
+        bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    # Return as RGB for EasyOCR
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
 
 # ─────────────────────────────────────────────────────────────────
 # OCR Engines
 # ─────────────────────────────────────────────────────────────────
 
 def run_tesseract(pil_img):
-    """Chạy Tesseract với config tối ưu cho hai loại hóa đơn."""
-    # PSM 6: Assume a single uniform block of text — tốt cho layout dọc lẫn ngang
-    config = (
+    """Chạy Tesseract với config tối ưu cho hai loại hóa đơn.
+
+    Runs PSM 6 (uniform block) and PSM 11 (sparse text) in parallel and returns
+    whichever produces more non-empty lines, giving better coverage for both
+    dense-layout and sparse-layout receipts.
+    """
+    config_psm6 = (
         "--psm 6 "
         "--oem 3 "
         "--dpi 300 "
         "-c preserve_interword_spaces=1 "
         "-c tessedit_do_invert=0"
     )
-    return pytesseract.image_to_string(pil_img, lang="vie+eng", config=config)
+    config_psm11 = (
+        "--psm 11 "
+        "--oem 3 "
+        "--dpi 300 "
+        "-c preserve_interword_spaces=1 "
+        "-c tessedit_do_invert=0"
+    )
+    try:
+        # ThreadPoolExecutor is appropriate here: pytesseract spawns an external
+        # tesseract process for each call, so the GIL is released while waiting,
+        # allowing genuine I/O-bound parallelism between the two PSM runs.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut6  = ex.submit(pytesseract.image_to_string, pil_img,
+                              lang="vie+eng", config=config_psm6)
+            fut11 = ex.submit(pytesseract.image_to_string, pil_img,
+                              lang="vie+eng", config=config_psm11)
+            text6  = fut6.result()
+            text11 = fut11.result()
+
+        lines6  = [l for l in text6.splitlines()  if l.strip()]
+        lines11 = [l for l in text11.splitlines() if l.strip()]
+        # Prefer PSM 11 if it captures meaningfully more content
+        return text11 if len(lines11) > len(lines6) * 1.1 else text6
+    except Exception:
+        # Fallback: try PSM 6 alone
+        return pytesseract.image_to_string(pil_img, lang="vie+eng", config=config_psm6)
 
 
 def run_easyocr(pil_img):
-    """Chạy EasyOCR, sắp xếp kết quả top→bottom, left→right."""
+    """Chạy EasyOCR, sắp xếp kết quả top→bottom, left→right.
+
+    Uses improved readtext parameters:
+    - contrast_ths=0.1  : detect low-contrast text regions
+    - adjust_contrast=0.7: normalize contrast before recognition
+    - text_threshold=0.6 : lower threshold to catch faint characters
+    - link_threshold=0.4 : group nearby text boxes more aggressively
+    """
     reader = get_easyocr_reader()
     if reader is None:
         return "", 0.0, []
     try:
         np_img = np.array(pil_img)
-        results = reader.readtext(np_img, detail=1, paragraph=False)
+        results = reader.readtext(
+            np_img,
+            detail=1,
+            paragraph=False,
+            contrast_ths=0.1,
+            adjust_contrast=0.7,
+            text_threshold=0.6,
+            link_threshold=0.4,
+        )
         results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
         lines = [text for _, text, _ in results]
         confidences = [conf for _, _, conf in results]
@@ -520,40 +589,105 @@ def run_easyocr(pil_img):
         return "", 0.0, []
 
 
+def _group_tess_boxes_to_lines(word_boxes: list[tuple]) -> list[tuple]:
+    """Merge Tesseract word-level boxes into line-level boxes.
+
+    Words whose vertical centres are within ``line_gap`` pixels of each other
+    are grouped into a single bounding rectangle.  The text and confidence of
+    each line box are aggregated (text joined by space, confidence averaged).
+
+    Returns a list of (x, y, w, h, text, confidence) tuples — same format as
+    the word boxes — but one entry per detected line instead of per word.
+    """
+    if not word_boxes:
+        return []
+
+    # Sort by vertical position first, then horizontal
+    sorted_boxes = sorted(word_boxes, key=lambda b: (b[1], b[0]))
+
+    lines: list[list[tuple]] = []    # list of accumulated line groups
+    current_line: list[tuple] = []   # current group of word boxes
+
+    for box in sorted_boxes:
+        bx, by, bw, bh, text, conf = box
+        cy = by + bh / 2  # vertical centre of this word
+
+        if not current_line:
+            current_line.append(box)
+        else:
+            # Estimate typical character height from already-collected words
+            avg_h = sum(b[3] for b in current_line) / len(current_line)
+            line_gap = max(avg_h * 0.6, 8)
+
+            # Check against the last word's centre in the current line
+            prev = current_line[-1]
+            prev_cy = prev[1] + prev[3] / 2
+
+            if abs(cy - prev_cy) <= line_gap:
+                current_line.append(box)
+            else:
+                lines.append(current_line)
+                current_line = [box]
+
+    if current_line:
+        lines.append(current_line)
+
+    # Convert each group into a single bounding box
+    result = []
+    for group in lines:
+        x1 = min(b[0] for b in group)
+        y1 = min(b[1] for b in group)
+        x2 = max(b[0] + b[2] for b in group)
+        y2 = max(b[1] + b[3] for b in group)
+        line_text = " ".join(b[4] for b in group)
+        avg_conf  = sum(b[5] for b in group) / len(group)
+        result.append((x1, y1, x2 - x1, y2 - y1, line_text, avg_conf))
+
+    return result
+
+
 def get_tess_word_boxes(pil_img) -> list:
-    """Return word-level bounding boxes from Tesseract as a list of
-    (x, y, w, h, text, confidence) tuples (confidence in [0, 1])."""
+    """Return line-level bounding boxes from Tesseract.
+
+    Internally collects word-level boxes then merges them into line groups via
+    ``_group_tess_boxes_to_lines`` for cleaner, more informative overlays.
+    Each entry is (x, y, w, h, text, confidence) with confidence in [0, 1].
+    """
     config = "--psm 6 --oem 3 --dpi 300"
     try:
         data = pytesseract.image_to_data(
             pil_img, lang="vie+eng", config=config,
             output_type=pytesseract.Output.DICT,
         )
-        boxes = []
+        word_boxes = []
         for i in range(len(data["text"])):
             word = data["text"][i].strip()
             conf = int(data["conf"][i])
             if word and conf > 0:
-                boxes.append((
+                word_boxes.append((
                     data["left"][i], data["top"][i],
                     data["width"][i], data["height"][i],
                     word, conf / 100.0,
                 ))
-        return boxes
+        return _group_tess_boxes_to_lines(word_boxes)
     except Exception:
         return []
 
 
 def merge_dual_ocr(tess_text, easy_text, easy_confidence):
     """Merge kết quả Tesseract và EasyOCR theo confidence voting.
-    Ưu tiên EasyOCR cho dòng có nhiều số, Tesseract cho text tiếng Việt."""
+    Ưu tiên EasyOCR cho dòng có nhiều số, Tesseract cho text tiếng Việt.
+
+    Threshold tuned down (1.2×, conf ≥ 0.60) so EasyOCR is preferred whenever
+    it extracts meaningfully more content at reasonable confidence.
+    """
     if not easy_text.strip():
         return tess_text
 
     tess_lines = [l for l in tess_text.splitlines() if l.strip()]
     easy_lines = [l for l in easy_text.splitlines() if l.strip()]
 
-    if len(easy_lines) > len(tess_lines) * 1.3 and easy_confidence >= 0.65:
+    if len(easy_lines) > len(tess_lines) * 1.2 and easy_confidence >= 0.60:
         return easy_text
 
     merged = []
@@ -574,7 +708,7 @@ def merge_dual_ocr(tess_text, easy_text, easy_confidence):
         digit_count = sum(c.isdigit() for c in t_line)
         has_numbers = digit_count >= 3
 
-        if best_easy and best_score >= 0.5 and has_numbers and easy_confidence >= 0.65:
+        if best_easy and best_score >= 0.5 and has_numbers and easy_confidence >= 0.60:
             merged.append(best_easy)
         else:
             merged.append(t_line)
@@ -1619,27 +1753,43 @@ class NextLevelOCRScanner(ctk.CTk):
         sx = dw / ow
         sy = dh / oh
 
+        # Padding (in canvas pixels) added around each box for better text coverage
+        _BOX_PAD = 3
+
         def _conf_color(conf: float) -> tuple[str, int]:
             """Return (outline_colour, line_width) based on confidence."""
             if conf >= 0.80:
                 return "#00FF88", 2   # bright green — high confidence
             if conf >= 0.55:
                 return "#FFD700", 2   # gold — medium confidence
-            return "#FF6B6B", 1       # red — low confidence
+            return "#FF6B6B", 2       # red — low confidence (thicker for visibility)
 
         def _draw_quad(pts_screen: list, text: str, conf: float, tag: str):
             color, lw = _conf_color(conf)
+            # Expand quad outward by _BOX_PAD pixels (axis-aligned approximation)
+            xs = pts_screen[0::2]
+            ys = pts_screen[1::2]
+            cx = sum(xs) / len(xs)
+            cy = sum(ys) / len(ys)
+            padded = []
+            for px, py in zip(xs, ys):
+                dx = px - cx
+                dy = py - cy
+                dist = (dx * dx + dy * dy) ** 0.5 or 1
+                padded.extend([px + dx / dist * _BOX_PAD,
+                                py + dy / dist * _BOX_PAD])
             canvas.create_polygon(
-                pts_screen,
+                padded,
                 outline=color, fill="", width=lw,
                 tags=(tag, "ocr_box"),
             )
-            # Confidence label above the top-left corner
-            tx = pts_screen[0]
-            ty = pts_screen[1] - 3
+            # Confidence label + truncated text above the top-left corner
+            tx = padded[0]
+            ty = padded[1] - 3
+            label_text = f"{conf * 100:.0f}%  {text[:24]}" if text else f"{conf * 100:.0f}%"
             canvas.create_text(
                 tx, ty,
-                text=f"{conf * 100:.0f}%",
+                text=label_text,
                 fill=color, font=("Consolas", 7),
                 anchor="sw", tags=(f"{tag}_lbl", "ocr_label"),
             )
@@ -1661,13 +1811,13 @@ class NextLevelOCRScanner(ctk.CTk):
                 canvas.tag_bind(tag, "<Leave>",
                                 lambda _e: self._hide_tooltip())
 
-        # Tesseract word boxes (axis-aligned rectangles)
+        # Tesseract line boxes (axis-aligned rectangles, merged from word boxes)
         if self._box_source in ("tess", "both"):
             for i, (bx, by, bw, bh, text, conf) in enumerate(self._ocr_boxes_tess):
-                x1 = ox + bx * sx
-                y1 = oy + by * sy
-                x2 = ox + (bx + bw) * sx
-                y2 = oy + (by + bh) * sy
+                x1 = ox + bx * sx - _BOX_PAD
+                y1 = oy + by * sy - _BOX_PAD
+                x2 = ox + (bx + bw) * sx + _BOX_PAD
+                y2 = oy + (by + bh) * sy + _BOX_PAD
                 color, lw = _conf_color(conf)
                 tag = f"tess_{i}"
                 canvas.create_rectangle(
@@ -1675,9 +1825,10 @@ class NextLevelOCRScanner(ctk.CTk):
                     outline=color, fill="", width=lw,
                     tags=(tag, "ocr_box"),
                 )
+                label_text = f"{conf * 100:.0f}%  {text[:24]}" if text else f"{conf * 100:.0f}%"
                 canvas.create_text(
                     x1, y1 - 2,
-                    text=f"{conf * 100:.0f}%",
+                    text=label_text,
                     fill=color, font=("Consolas", 7),
                     anchor="sw", tags=(f"{tag}_lbl", "ocr_label"),
                 )
