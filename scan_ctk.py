@@ -8,6 +8,7 @@ import shutil
 import logging
 import logging.handlers
 import time
+import tkinter as tk
 import tkinter.messagebox as messagebox
 import tkinter.ttk as ttk
 import numpy as np  # type: ignore
@@ -517,6 +518,30 @@ def run_easyocr(pil_img):
         return full_text, avg_conf, results
     except Exception:
         return "", 0.0, []
+
+
+def get_tess_word_boxes(pil_img) -> list:
+    """Return word-level bounding boxes from Tesseract as a list of
+    (x, y, w, h, text, confidence) tuples (confidence in [0, 1])."""
+    config = "--psm 6 --oem 3 --dpi 300"
+    try:
+        data = pytesseract.image_to_data(
+            pil_img, lang="vie+eng", config=config,
+            output_type=pytesseract.Output.DICT,
+        )
+        boxes = []
+        for i in range(len(data["text"])):
+            word = data["text"][i].strip()
+            conf = int(data["conf"][i])
+            if word and conf > 0:
+                boxes.append((
+                    data["left"][i], data["top"][i],
+                    data["width"][i], data["height"][i],
+                    word, conf / 100.0,
+                ))
+        return boxes
+    except Exception:
+        return []
 
 
 def merge_dual_ocr(tess_text, easy_text, easy_confidence):
@@ -1135,6 +1160,17 @@ class NextLevelOCRScanner(ctk.CTk):
         self._batch_running          = False
         self._batch_cancel           = threading.Event()
 
+        # ── Bounding-box / OCR overlay state ───────────────────
+        self._ocr_boxes_easy: list       = []   # [(bbox_quad, text, conf), ...]
+        self._ocr_boxes_tess: list       = []   # [(x, y, w, h, text, conf), ...]
+        self._show_boxes: bool           = True
+        self._box_source: str            = "both"  # "easy" | "tess" | "both"
+        self._canvas_img_offset          = (0, 0)
+        self._canvas_display_size        = (0, 0)
+        self._canvas_orig_size           = (0, 0)
+        self._preview_canvas_img         = None    # keep PhotoImage reference
+        self._tooltip_window: tk.Toplevel | None = None
+
         # ── Layout ─────────────────────────────────────────────
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=4)
@@ -1218,12 +1254,16 @@ class NextLevelOCRScanner(ctk.CTk):
         self.preview_frame.grid_rowconfigure(1, weight=1)
         self.preview_frame.grid_columnconfigure(0, weight=1)
 
-        # Toolbar
+        # ── Toolbar ────────────────────────────────────────────
         tb = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
         tb.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 0))
-        self._img_name_label = ctk.CTkLabel(tb, text="No image selected",
-                                             font=ctk.CTkFont(size=12, weight="bold"))
+
+        self._img_name_label = ctk.CTkLabel(
+            tb, text="No image selected",
+            font=ctk.CTkFont(size=12, weight="bold"))
         self._img_name_label.pack(side='left')
+
+        # Zoom buttons (right side, added right-to-left so order stays readable)
         ctk.CTkButton(tb, text="🔍+", width=36,
                       command=lambda: self._zoom(1.2)).pack(side='right', padx=2)
         ctk.CTkButton(tb, text="🔍−", width=36,
@@ -1231,10 +1271,45 @@ class NextLevelOCRScanner(ctk.CTk):
         ctk.CTkButton(tb, text="⟳", width=36,
                       command=self._zoom_reset).pack(side='right', padx=2)
 
-        self.preview_label = ctk.CTkLabel(
-            self.preview_frame, text="No Image Selected",
-            font=ctk.CTkFont(size=14))
-        self.preview_label.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        # Box-source selector (EasyOCR / Tesseract / Both)
+        self._box_source_var = ctk.StringVar(value="both")
+        ctk.CTkOptionMenu(
+            tb, variable=self._box_source_var,
+            values=["both", "easy", "tess"],
+            width=84, command=self._on_box_source_change,
+        ).pack(side='right', padx=2)
+        ctk.CTkLabel(tb, text="Source:", font=ctk.CTkFont(size=11)
+                     ).pack(side='right', padx=(10, 2))
+
+        # Boxes toggle
+        self._boxes_btn = ctk.CTkButton(
+            tb, text="🔲 Boxes ON", width=100,
+            fg_color="#1D4ED8", hover_color="#1E40AF",
+            command=self._toggle_boxes)
+        self._boxes_btn.pack(side='right', padx=(2, 6))
+
+        # ── Canvas (replaces CTkLabel) ─────────────────────────
+        canvas_host = ctk.CTkFrame(self.preview_frame, fg_color="#111827")
+        canvas_host.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        canvas_host.grid_rowconfigure(0, weight=1)
+        canvas_host.grid_columnconfigure(0, weight=1)
+
+        self._preview_canvas = tk.Canvas(
+            canvas_host, bg="#111827", highlightthickness=0, cursor="crosshair")
+        self._preview_canvas.grid(row=0, column=0, sticky="nsew")
+
+        # Bind mouse events
+        self._preview_canvas.bind("<MouseWheel>", self._on_canvas_scroll)   # Win/Mac
+        self._preview_canvas.bind("<Button-4>",   self._on_canvas_scroll)   # Linux up
+        self._preview_canvas.bind("<Button-5>",   self._on_canvas_scroll)   # Linux down
+        self._preview_canvas.bind("<Button-1>",   self._on_canvas_click)
+        self._preview_canvas.bind("<Motion>",     self._on_canvas_hover)
+        self._preview_canvas.bind("<Leave>",      self._on_canvas_leave)
+
+        # Placeholder text
+        self._preview_canvas.create_text(
+            400, 300, text="No Image Selected",
+            fill="gray40", font=("Segoe UI", 16), tags="placeholder")
 
         self._zoom_factor  = 1.0
         self._base_pil_img = None
@@ -1254,25 +1329,53 @@ class NextLevelOCRScanner(ctk.CTk):
         self.tabview.add("Structured Data")
         self.tabview.add("Raw OCR Text")
 
-        for tab_name, fg, tc, init_text in [
-            ("Structured Data", "#0F111A", "#00FFAA",
-             "--- No Data ---\nHit SCAN to extract structured receipt data."),
-            ("Raw OCR Text",    "#1E1E1E", "white",
-             "Waiting for input...\n"),
-        ]:
-            tab = self.tabview.tab(tab_name)
-            tab.grid_rowconfigure(0, weight=1)
-            tab.grid_columnconfigure(0, weight=1)
-            box = ctk.CTkTextbox(tab, fg_color=fg, text_color=tc,
-                                  font=ctk.CTkFont(family="Courier New", size=12),
-                                  corner_radius=8)
-            box.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-            box.insert("0.0", init_text)
-            box.configure(state="disabled")
-            if tab_name == "Structured Data":
-                self.smart_data_box = box
-            else:
-                self.raw_data_box = box
+        # ── Structured Data tab ────────────────────────────────
+        sd_tab = self.tabview.tab("Structured Data")
+        sd_tab.grid_rowconfigure(0, weight=1)
+        sd_tab.grid_columnconfigure(0, weight=1)
+        self.smart_data_box = ctk.CTkTextbox(
+            sd_tab, fg_color="#0F111A", text_color="#00FFAA",
+            font=ctk.CTkFont(family="Courier New", size=12), corner_radius=8)
+        self.smart_data_box.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.smart_data_box.insert("0.0",
+            "--- No Data ---\nHit SCAN to extract structured receipt data.")
+        self.smart_data_box.configure(state="disabled")
+
+        # ── Raw OCR Text tab ───────────────────────────────────
+        raw_tab = self.tabview.tab("Raw OCR Text")
+        raw_tab.grid_rowconfigure(1, weight=1)
+        raw_tab.grid_columnconfigure(0, weight=1)
+
+        # Search bar inside the Raw OCR tab
+        search_frame = ctk.CTkFrame(raw_tab, fg_color="transparent")
+        search_frame.grid(row=0, column=0, sticky="ew", pady=(4, 2))
+        search_frame.grid_columnconfigure(0, weight=1)
+        self._ocr_search_var = ctk.StringVar()
+        search_entry = ctk.CTkEntry(
+            search_frame, textvariable=self._ocr_search_var,
+            placeholder_text="🔍 Search in OCR text…", height=28)
+        search_entry.grid(row=0, column=0, sticky="ew", padx=(4, 2))
+        ctk.CTkButton(
+            search_frame, text="Find", width=50,
+            command=self._ocr_text_search).grid(row=0, column=1, padx=(0, 4))
+        ctk.CTkButton(
+            search_frame, text="✕", width=30,
+            fg_color="#4B5563", hover_color="#374151",
+            command=self._ocr_text_clear_search).grid(row=0, column=2, padx=(0, 4))
+        search_entry.bind("<Return>", lambda _e: self._ocr_text_search())
+
+        self.raw_data_box = ctk.CTkTextbox(
+            raw_tab, fg_color="#1E1E1E", text_color="white",
+            font=ctk.CTkFont(family="Courier New", size=12), corner_radius=8)
+        self.raw_data_box.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        self.raw_data_box.insert("0.0", "Waiting for input…\n")
+        self.raw_data_box.configure(state="disabled")
+
+        # Configure highlight tags on the underlying tk Text widget
+        self.raw_data_box._textbox.tag_configure(
+            "search_hit", background="#FFD700", foreground="#000000")
+        self.raw_data_box._textbox.tag_configure(
+            "box_hit", background="#00BFFF", foreground="#000000")
 
         # Progress
         self.progress_bar = ctk.CTkProgressBar(
@@ -1431,6 +1534,9 @@ class NextLevelOCRScanner(ctk.CTk):
         self.current_image_path = path
         for p, btn in self.file_buttons.items():
             btn.configure(fg_color="gray25" if p == path else "transparent")
+        # Clear previous OCR boxes when a new image is loaded
+        self._ocr_boxes_easy = []
+        self._ocr_boxes_tess = []
         try:
             self._base_pil_img = Image.open(path)
             self._zoom_factor  = 1.0
@@ -1442,24 +1548,53 @@ class NextLevelOCRScanner(ctk.CTk):
             self.set_status(f"Preview: {os.path.basename(path)}")
         except Exception as exc:
             logger.error("display_image error: %s", exc)
-            self.preview_label.configure(image=None, text=f"Cannot open image:\n{exc}")
+            self._preview_canvas.delete("all")
+            self._preview_canvas.create_text(
+                400, 300, text=f"Cannot open image:\n{exc}",
+                fill="#FF6B6B", font=("Segoe UI", 13))
 
     def _render_image(self):
+        """Render the current PIL image (+ optional bounding boxes) onto the Canvas."""
         if self._base_pil_img is None:
             return
-        img = self._base_pil_img.copy()
-        w   = int(img.width  * self._zoom_factor)
-        h   = int(img.height * self._zoom_factor)
-        max_w = self.preview_frame.winfo_width()  or _DEFAULT_PREVIEW_W
-        max_h = self.preview_frame.winfo_height() or _DEFAULT_PREVIEW_H
-        if w > max_w or h > max_h:
-            img.thumbnail((max_w - 20, max_h - 60), Image.Resampling.LANCZOS)
-        else:
-            img = img.resize((w, h), Image.Resampling.LANCZOS)
-        tk_img = ctk.CTkImage(light_image=img, dark_image=img,
-                               size=(img.width, img.height))
-        self.preview_label.configure(image=tk_img, text="")
-        self.preview_label.image = tk_img
+        canvas = self._preview_canvas
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+        # winfo_width/height returns 1 before the widget is fully mapped
+        if cw <= 1:
+            cw = _DEFAULT_PREVIEW_W
+        if ch <= 1:
+            ch = _DEFAULT_PREVIEW_H
+
+        img      = self._base_pil_img.copy()
+        orig_w, orig_h = img.size
+
+        # Compute display size respecting zoom and canvas bounds
+        display_w = int(orig_w * self._zoom_factor)
+        display_h = int(orig_h * self._zoom_factor)
+        if display_w > cw or display_h > ch:
+            ratio     = min((cw - 20) / max(orig_w, 1), (ch - 20) / max(orig_h, 1))
+            display_w = max(1, int(orig_w * ratio))
+            display_h = max(1, int(orig_h * ratio))
+
+        img = img.resize((display_w, display_h), Image.Resampling.LANCZOS)
+
+        # Center image inside canvas
+        offset_x = max(0, (cw - display_w) // 2)
+        offset_y = max(0, (ch - display_h) // 2)
+        self._canvas_img_offset   = (offset_x, offset_y)
+        self._canvas_display_size = (display_w, display_h)
+        self._canvas_orig_size    = (orig_w, orig_h)
+
+        tk_img = ImageTk.PhotoImage(img)
+        self._preview_canvas_img = tk_img   # keep reference to prevent GC
+
+        canvas.delete("all")
+        canvas.create_image(offset_x, offset_y, anchor="nw", image=tk_img)
+
+        # Overlay bounding boxes if toggled on
+        if self._show_boxes:
+            self._draw_boxes_on_canvas()
 
     def _zoom(self, factor: float):
         self._zoom_factor = max(_MIN_ZOOM, min(self._zoom_factor * factor, _MAX_ZOOM))
@@ -1468,6 +1603,218 @@ class NextLevelOCRScanner(ctk.CTk):
     def _zoom_reset(self):
         self._zoom_factor = 1.0
         self._render_image()
+
+    # ──────────────────────────────────────────────────────────
+    # Bounding-box overlay
+    # ──────────────────────────────────────────────────────────
+
+    def _draw_boxes_on_canvas(self):
+        """Draw OCR bounding boxes on the preview canvas, colour-coded by confidence."""
+        canvas = self._preview_canvas
+        ox, oy = self._canvas_img_offset
+        dw, dh = self._canvas_display_size
+        ow, oh = self._canvas_orig_size
+        if ow == 0 or oh == 0:
+            return
+        sx = dw / ow
+        sy = dh / oh
+
+        def _conf_color(conf: float) -> tuple[str, int]:
+            """Return (outline_colour, line_width) based on confidence."""
+            if conf >= 0.80:
+                return "#00FF88", 2   # bright green — high confidence
+            if conf >= 0.55:
+                return "#FFD700", 2   # gold — medium confidence
+            return "#FF6B6B", 1       # red — low confidence
+
+        def _draw_quad(pts_screen: list, text: str, conf: float, tag: str):
+            color, lw = _conf_color(conf)
+            canvas.create_polygon(
+                pts_screen,
+                outline=color, fill="", width=lw,
+                tags=(tag, "ocr_box"),
+            )
+            # Confidence label above the top-left corner
+            tx = pts_screen[0]
+            ty = pts_screen[1] - 3
+            canvas.create_text(
+                tx, ty,
+                text=f"{conf * 100:.0f}%",
+                fill=color, font=("Consolas", 7),
+                anchor="sw", tags=(f"{tag}_lbl", "ocr_label"),
+            )
+
+        # EasyOCR boxes (quad polygons)
+        if self._box_source in ("easy", "both"):
+            for i, (bbox, text, conf) in enumerate(self._ocr_boxes_easy):
+                pts = []
+                for px, py in bbox:
+                    pts.extend([ox + px * sx, oy + py * sy])
+                tag = f"easy_{i}"
+                _draw_quad(pts, text, conf, tag)
+                canvas.tag_bind(tag, "<Button-1>",
+                                lambda _e, t=text, c=conf, s="EasyOCR":
+                                    self._on_box_click(t, c, s))
+                canvas.tag_bind(tag, "<Enter>",
+                                lambda e, t=text, c=conf, s="EasyOCR":
+                                    self._show_box_tooltip(e, t, c, s))
+                canvas.tag_bind(tag, "<Leave>",
+                                lambda _e: self._hide_tooltip())
+
+        # Tesseract word boxes (axis-aligned rectangles)
+        if self._box_source in ("tess", "both"):
+            for i, (bx, by, bw, bh, text, conf) in enumerate(self._ocr_boxes_tess):
+                x1 = ox + bx * sx
+                y1 = oy + by * sy
+                x2 = ox + (bx + bw) * sx
+                y2 = oy + (by + bh) * sy
+                color, lw = _conf_color(conf)
+                tag = f"tess_{i}"
+                canvas.create_rectangle(
+                    x1, y1, x2, y2,
+                    outline=color, fill="", width=lw,
+                    tags=(tag, "ocr_box"),
+                )
+                canvas.create_text(
+                    x1, y1 - 2,
+                    text=f"{conf * 100:.0f}%",
+                    fill=color, font=("Consolas", 7),
+                    anchor="sw", tags=(f"{tag}_lbl", "ocr_label"),
+                )
+                canvas.tag_bind(tag, "<Button-1>",
+                                lambda _e, t=text, c=conf, s="Tesseract":
+                                    self._on_box_click(t, c, s))
+                canvas.tag_bind(tag, "<Enter>",
+                                lambda e, t=text, c=conf, s="Tesseract":
+                                    self._show_box_tooltip(e, t, c, s))
+                canvas.tag_bind(tag, "<Leave>",
+                                lambda _e: self._hide_tooltip())
+
+    # ──────────────────────────────────────────────────────────
+    # Canvas event handlers
+    # ──────────────────────────────────────────────────────────
+
+    def _on_canvas_scroll(self, event):
+        """Zoom with mouse-wheel."""
+        if event.num == 4 or getattr(event, "delta", 0) > 0:
+            self._zoom(1.1)
+        else:
+            self._zoom(1 / 1.1)
+
+    def _on_canvas_click(self, event):
+        """Click on canvas background (not on a box) — show pixel info."""
+        ox, oy = self._canvas_img_offset
+        dw, dh = self._canvas_display_size
+        ow, oh = self._canvas_orig_size
+        if dw and dh and ow and oh:
+            px = int((event.x - ox) * ow / dw)
+            py = int((event.y - oy) * oh / dh)
+            if 0 <= px < ow and 0 <= py < oh:
+                self.set_status(f"📍 Image coords: ({px}, {py})")
+
+    def _on_canvas_hover(self, _event):
+        """Placeholder — per-box hover is handled by tag_bind."""
+
+    def _on_canvas_leave(self, _event):
+        self._hide_tooltip()
+
+    def _on_box_click(self, text: str, conf: float, source: str):
+        """Highlight the clicked OCR word in the Raw OCR Text tab."""
+        self._hide_tooltip()
+        self.tabview.set("Raw OCR Text")
+        tw = self.raw_data_box._textbox
+        tw.tag_remove("box_hit", "1.0", "end")
+        idx = "1.0"
+        count = 0
+        while True:
+            pos = tw.search(text, idx, "end", nocase=True)
+            if not pos:
+                break
+            end_pos = f"{pos}+{len(text)}c"
+            tw.tag_add("box_hit", pos, end_pos)
+            if count == 0:
+                tw.see(pos)   # scroll to first occurrence
+            idx = end_pos
+            count += 1
+        self.set_status(
+            f"🔍 OCR box [{source}]: '{text[:60]}' "
+            f"(conf {conf * 100:.0f}%) — {count} match{'es' if count != 1 else ''}")
+
+    def _show_box_tooltip(self, event, text: str, conf: float, source: str):
+        """Show a small floating tooltip with OCR text and confidence."""
+        self._hide_tooltip()
+        tw = tk.Toplevel(self)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{event.x_root + 12}+{event.y_root - 36}")
+        msg = f"[{source}]  conf: {conf * 100:.0f}%\n{text[:80]}"
+        lbl = tk.Label(
+            tw, text=msg, justify="left",
+            background="#1E293B", foreground="#00FF88",
+            font=("Consolas", 9), relief="solid", borderwidth=1,
+            padx=6, pady=4)
+        lbl.pack()
+        self._tooltip_window = tw
+
+    def _hide_tooltip(self):
+        if self._tooltip_window:
+            try:
+                self._tooltip_window.destroy()
+            except Exception:
+                pass
+            self._tooltip_window = None
+
+    # ──────────────────────────────────────────────────────────
+    # Box-overlay controls
+    # ──────────────────────────────────────────────────────────
+
+    def _toggle_boxes(self):
+        self._show_boxes = not self._show_boxes
+        if self._show_boxes:
+            self._boxes_btn.configure(
+                text="🔲 Boxes ON", fg_color="#1D4ED8", hover_color="#1E40AF")
+        else:
+            self._boxes_btn.configure(
+                text="⬜ Boxes OFF", fg_color="#374151", hover_color="#1F2937")
+        self._render_image()
+
+    def _on_box_source_change(self, value: str):
+        self._box_source = value
+        self._render_image()
+
+    # ──────────────────────────────────────────────────────────
+    # OCR text search / highlight
+    # ──────────────────────────────────────────────────────────
+
+    def _ocr_text_search(self):
+        """Highlight all occurrences of the search term in the Raw OCR Text box."""
+        query = self._ocr_search_var.get().strip()
+        tw = self.raw_data_box._textbox
+        tw.tag_remove("search_hit", "1.0", "end")
+        if not query:
+            return
+        idx = "1.0"
+        count = 0
+        first_pos = None
+        while True:
+            pos = tw.search(query, idx, "end", nocase=True)
+            if not pos:
+                break
+            end_pos = f"{pos}+{len(query)}c"
+            tw.tag_add("search_hit", pos, end_pos)
+            if first_pos is None:
+                first_pos = pos
+            idx = end_pos
+            count += 1
+        if first_pos:
+            tw.see(first_pos)
+        self.set_status(
+            f"🔍 Found {count} occurrence{'s' if count != 1 else ''} of '{query}'")
+
+    def _ocr_text_clear_search(self):
+        """Clear the search highlight."""
+        self._ocr_search_var.set("")
+        self.raw_data_box._textbox.tag_remove("search_hit", "1.0", "end")
+        self.set_status("Search cleared.")
 
     # ──────────────────────────────────────────────────────────
     # Single Scan
@@ -1508,11 +1855,14 @@ class NextLevelOCRScanner(ctk.CTk):
             img_tess     = preprocess_image(original_img)
             img_easy     = preprocess_for_easyocr(original_img)
 
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                fut_tess = ex.submit(run_tesseract, img_tess)
-                fut_easy = ex.submit(run_easyocr,   img_easy)
-                tess_text            = fut_tess.result()
-                easy_text, easy_conf, _ = fut_easy.result()
+            # 3 workers: Tesseract text, EasyOCR text+boxes, Tesseract word boxes
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                fut_tess      = ex.submit(run_tesseract,       img_tess)
+                fut_easy      = ex.submit(run_easyocr,         img_easy)
+                fut_tess_boxes = ex.submit(get_tess_word_boxes, img_tess)
+                tess_text              = fut_tess.result()
+                easy_text, easy_conf, easy_boxes = fut_easy.result()
+                tess_boxes             = fut_tess_boxes.result()
 
             if easy_text.strip():
                 engine_label   = f"Tesseract + EasyOCR ✅ (conf: {easy_conf * 100:.1f}%)"
@@ -1540,18 +1890,18 @@ class NextLevelOCRScanner(ctk.CTk):
 
             self.after(0, self._finish_single_scan,
                        smart_out, raw_out, metadata, receipt_type,
-                       elapsed_ms, engine_label)
+                       elapsed_ms, engine_label, easy_boxes, tess_boxes)
 
         except pytesseract.TesseractError as exc:
             err = ("Language pack 'vie.traineddata' missing!"
                    if 'Failed loading language' in str(exc) else str(exc))
             logger.error("Tesseract error on %s: %s", image_path, err)
             self.after(0, self._finish_single_scan,
-                       f"ERROR\n{err}", err, None, "unknown", 0, "")
+                       f"ERROR\n{err}", err, None, "unknown", 0, "", [], [])
         except Exception as exc:
             logger.error("Scan error on %s: %s", image_path, exc, exc_info=True)
             self.after(0, self._finish_single_scan,
-                       f"CRITICAL ERROR\n{exc}", str(exc), None, "unknown", 0, "")
+                       f"CRITICAL ERROR\n{exc}", str(exc), None, "unknown", 0, "", [], [])
 
     def _format_output(self, engine_label, receipt_type, metadata,
                        extracted_text, easy_text, elapsed_ms):
@@ -1578,11 +1928,22 @@ class NextLevelOCRScanner(ctk.CTk):
         return smart.strip(), raw
 
     def _finish_single_scan(self, smart_text, raw_text, metadata,
-                             receipt_type, elapsed_ms, engine_label):
+                             receipt_type, elapsed_ms, engine_label,
+                             easy_boxes=None, tess_boxes=None):
         self.update_textbox(self.smart_data_box, smart_text)
         self.update_textbox(self.raw_data_box,   raw_text)
         self.latest_metadata     = metadata or {}
         self.latest_receipt_type = receipt_type
+
+        # Store OCR boxes and re-render preview with overlays
+        self._ocr_boxes_easy = easy_boxes or []
+        self._ocr_boxes_tess = tess_boxes or []
+        self._render_image()
+
+        easy_n = len(self._ocr_boxes_easy)
+        tess_n = len(self._ocr_boxes_tess)
+        logger.info("Boxes — EasyOCR: %d, Tesseract: %d", easy_n, tess_n)
+
         self.progress_bar.stop()
         self.progress_bar.set(0)
         self.btn_scan.configure(state="normal", text="▶  START SCAN  (Ctrl+S)")
@@ -1590,7 +1951,8 @@ class NextLevelOCRScanner(ctk.CTk):
         self._refresh_stats_label()
         status = (f"✅ Done in {elapsed_ms} ms | "
                   f"Engine: {engine_label} | "
-                  f"Fields: {len(metadata) if metadata else 0}")
+                  f"Fields: {len(metadata) if metadata else 0} | "
+                  f"Boxes: {easy_n} Easy / {tess_n} Tess")
         self.set_status(status)
         logger.info("Single scan done: %dms, fields=%d",
                     elapsed_ms, len(metadata) if metadata else 0)
