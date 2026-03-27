@@ -19,7 +19,7 @@ import sqlite3
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from PIL import Image, ImageTk, ImageEnhance, ImageFilter, ImageOps  # type: ignore
+from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageEnhance, ImageFilter, ImageOps  # type: ignore
 
 try:
     import pytesseract  # type: ignore
@@ -1422,6 +1422,13 @@ class NextLevelOCRScanner(ctk.CTk):
             command=self._toggle_boxes)
         self._boxes_btn.pack(side='right', padx=(2, 6))
 
+        # Save annotated image button
+        self._btn_save_img = ctk.CTkButton(
+            tb, text="💾 Save Image", width=110,
+            fg_color="#065F46", hover_color="#047857",
+            command=self.save_annotated_image)
+        self._btn_save_img.pack(side='right', padx=(2, 2))
+
         # ── Canvas (replaces CTkLabel) ─────────────────────────
         canvas_host = ctk.CTkFrame(self.preview_frame, fg_color="#111827")
         canvas_host.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
@@ -1720,15 +1727,19 @@ class NextLevelOCRScanner(ctk.CTk):
         self._canvas_display_size = (display_w, display_h)
         self._canvas_orig_size    = (orig_w, orig_h)
 
+        # Draw bounding boxes directly onto the image pixels if toggled on
+        if self._show_boxes:
+            img = self._draw_boxes_on_image(img, display_w, display_h, orig_w, orig_h)
+
         tk_img = ImageTk.PhotoImage(img)
         self._preview_canvas_img = tk_img   # keep reference to prevent GC
 
         canvas.delete("all")
         canvas.create_image(offset_x, offset_y, anchor="nw", image=tk_img)
 
-        # Overlay bounding boxes if toggled on
+        # Place invisible hit-areas on the canvas so click/hover interactions still work
         if self._show_boxes:
-            self._draw_boxes_on_canvas()
+            self._draw_boxes_on_canvas(hit_only=True)
 
     def _zoom(self, factor: float):
         self._zoom_factor = max(_MIN_ZOOM, min(self._zoom_factor * factor, _MAX_ZOOM))
@@ -1742,8 +1753,95 @@ class NextLevelOCRScanner(ctk.CTk):
     # Bounding-box overlay
     # ──────────────────────────────────────────────────────────
 
-    def _draw_boxes_on_canvas(self):
-        """Draw OCR bounding boxes on the preview canvas, colour-coded by confidence."""
+    @staticmethod
+    def _box_conf_color_rgb(conf: float) -> tuple:
+        """Return an RGB colour tuple for a given confidence score."""
+        if conf >= 0.80:
+            return (0, 255, 136)    # bright green — high confidence
+        if conf >= 0.55:
+            return (255, 215, 0)    # gold — medium confidence
+        return (255, 107, 107)      # red — low confidence
+
+    def _draw_boxes_on_image(
+        self,
+        img: Image.Image,
+        dw: int,
+        dh: int,
+        ow: int,
+        oh: int,
+    ) -> Image.Image:
+        """Draw OCR bounding boxes directly onto a PIL image (raster pixels).
+
+        Boxes are colour-coded by confidence and drawn at the display resolution
+        (``dw`` × ``dh``), which is the already-resized copy of the original
+        (``ow`` × ``oh``) image.
+        """
+        if ow == 0 or oh == 0:
+            return img
+
+        draw = ImageDraw.Draw(img)
+        sx = dw / ow
+        sy = dh / oh
+        _BOX_PAD    = 3
+        _LABEL_OFFS = 12   # pixels above the top-left corner to place text
+
+        # Try common monospace fonts in order; fall back to PIL's built-in default
+        _font = ImageFont.load_default()
+        for _fname in ("consola.ttf", "DejaVuSansMono.ttf", "LiberationMono-Regular.ttf",
+                       "Courier New.ttf", "cour.ttf"):
+            try:
+                _font = ImageFont.truetype(_fname, 10)
+                break
+            except Exception:
+                continue
+
+        def _label(text: str, conf: float) -> str:
+            return f"{conf * 100:.0f}%  {text[:24]}" if text else f"{conf * 100:.0f}%"
+
+        # EasyOCR boxes (quad polygons)
+        if self._box_source in ("easy", "both"):
+            for bbox, text, conf in self._ocr_boxes_easy:
+                color = self._box_conf_color_rgb(conf)
+                pts = [(px * sx, py * sy) for px, py in bbox]
+
+                # Expand each vertex outward from the centroid by _BOX_PAD pixels
+                cx = sum(p[0] for p in pts) / len(pts)
+                cy = sum(p[1] for p in pts) / len(pts)
+                padded = []
+                for px, py in pts:
+                    dx, dy = px - cx, py - cy
+                    dist = (dx * dx + dy * dy) ** 0.5 or 1
+                    padded.append((px + dx / dist * _BOX_PAD,
+                                   py + dy / dist * _BOX_PAD))
+
+                draw.polygon(padded, outline=color, width=2)
+                tx, ty = padded[0]
+                draw.text((tx, max(0, ty - _LABEL_OFFS)), _label(text, conf),
+                          fill=color, font=_font)
+
+        # Tesseract line boxes (axis-aligned rectangles)
+        if self._box_source in ("tess", "both"):
+            for bx, by, bw, bh, text, conf in self._ocr_boxes_tess:
+                color = self._box_conf_color_rgb(conf)
+                x1 = bx * sx - _BOX_PAD
+                y1 = by * sy - _BOX_PAD
+                x2 = (bx + bw) * sx + _BOX_PAD
+                y2 = (by + bh) * sy + _BOX_PAD
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+                draw.text((x1, max(0, y1 - _LABEL_OFFS)), _label(text, conf),
+                          fill=color, font=_font)
+
+        return img
+
+    def _draw_boxes_on_canvas(self, hit_only: bool = False):
+        """Place OCR bounding boxes on the preview canvas.
+
+        When *hit_only* is ``True`` the boxes are drawn as invisible, transparent
+        canvas items whose sole purpose is to carry click/hover event bindings so
+        that the interactive tooltip and text-highlight features continue to work
+        even though the visual box outlines are now rasterised directly onto the
+        image via :meth:`_draw_boxes_on_image`.
+        """
         canvas = self._preview_canvas
         ox, oy = self._canvas_img_offset
         dw, dh = self._canvas_display_size
@@ -1753,7 +1851,7 @@ class NextLevelOCRScanner(ctk.CTk):
         sx = dw / ow
         sy = dh / oh
 
-        # Padding (in canvas pixels) added around each box for better text coverage
+        # Padding (in canvas pixels) added around each box
         _BOX_PAD = 3
 
         def _conf_color(conf: float) -> tuple[str, int]:
@@ -1765,6 +1863,14 @@ class NextLevelOCRScanner(ctk.CTk):
             return "#FF6B6B", 2       # red — low confidence (thicker for visibility)
 
         def _draw_quad(pts_screen: list, text: str, conf: float, tag: str):
+            if hit_only:
+                # Invisible stipple polygon — sole purpose is event binding
+                canvas.create_polygon(
+                    pts_screen,
+                    outline="", fill="white", stipple="gray12",
+                    tags=(tag, "ocr_box"),
+                )
+                return
             color, lw = _conf_color(conf)
             # Expand quad outward by _BOX_PAD pixels (axis-aligned approximation)
             xs = pts_screen[0::2]
@@ -1818,20 +1924,27 @@ class NextLevelOCRScanner(ctk.CTk):
                 y1 = oy + by * sy - _BOX_PAD
                 x2 = ox + (bx + bw) * sx + _BOX_PAD
                 y2 = oy + (by + bh) * sy + _BOX_PAD
-                color, lw = _conf_color(conf)
                 tag = f"tess_{i}"
-                canvas.create_rectangle(
-                    x1, y1, x2, y2,
-                    outline=color, fill="", width=lw,
-                    tags=(tag, "ocr_box"),
-                )
-                label_text = f"{conf * 100:.0f}%  {text[:24]}" if text else f"{conf * 100:.0f}%"
-                canvas.create_text(
-                    x1, y1 - 2,
-                    text=label_text,
-                    fill=color, font=("Consolas", 7),
-                    anchor="sw", tags=(f"{tag}_lbl", "ocr_label"),
-                )
+                if hit_only:
+                    canvas.create_rectangle(
+                        x1, y1, x2, y2,
+                        outline="", fill="white", stipple="gray12",
+                        tags=(tag, "ocr_box"),
+                    )
+                else:
+                    color, lw = _conf_color(conf)
+                    canvas.create_rectangle(
+                        x1, y1, x2, y2,
+                        outline=color, fill="", width=lw,
+                        tags=(tag, "ocr_box"),
+                    )
+                    label_text = f"{conf * 100:.0f}%  {text[:24]}" if text else f"{conf * 100:.0f}%"
+                    canvas.create_text(
+                        x1, y1 - 2,
+                        text=label_text,
+                        fill=color, font=("Consolas", 7),
+                        anchor="sw", tags=(f"{tag}_lbl", "ocr_label"),
+                    )
                 canvas.tag_bind(tag, "<Button-1>",
                                 lambda _e, t=text, c=conf, s="Tesseract":
                                     self._on_box_click(t, c, s))
@@ -2203,6 +2316,36 @@ class NextLevelOCRScanner(ctk.CTk):
     # ──────────────────────────────────────────────────────────
     # Export / Clipboard
     # ──────────────────────────────────────────────────────────
+
+    def save_annotated_image(self):
+        """Save the current image with OCR bounding boxes burned directly into it."""
+        if self._base_pil_img is None:
+            self.set_status("⚠️  No image loaded.")
+            return
+
+        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base = os.path.splitext(os.path.basename(self.current_image_path or "image"))[0]
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".png",
+            initialfile=f"{base}_annotated_{ts}.png",
+            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg")],
+        )
+        if not path:
+            return
+
+        try:
+            img = self._base_pil_img.copy()
+            ow, oh = img.size
+            # Draw boxes at original full resolution (no scaling needed — OCR coords
+            # are already in original-image pixel space)
+            img = self._draw_boxes_on_image(img, ow, oh, ow, oh)
+            img.save(path)
+            self._flash_button(self._btn_save_img, "✅ Saved!", "💾 Save Image")
+            self.set_status(f"Annotated image saved: {path}")
+            logger.info("Annotated image saved: %s", path)
+        except Exception as exc:
+            logger.error("Save annotated image error: %s", exc)
+            messagebox.showerror("Save Error", f"Failed to save image:\n{exc}")
 
     def copy_data_to_clipboard(self):
         if self.latest_metadata:
