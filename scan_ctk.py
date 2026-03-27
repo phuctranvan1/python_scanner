@@ -5,14 +5,19 @@ import re
 import zipfile
 import unicodedata
 import shutil
+import logging
+import logging.handlers
+import time
+import tkinter.messagebox as messagebox
+import tkinter.ttk as ttk
 import numpy as np  # type: ignore
 import csv
 import json
 import difflib
 import sqlite3
-import cv2  # type: ignore
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from PIL import Image, ImageTk, ImageEnhance, ImageFilter, ImageOps  # type: ignore
 
 try:
@@ -23,101 +28,357 @@ except ImportError:
     print("pip install Pillow pytesseract customtkinter opencv-python")
     sys.exit(1)
 
-# Set Tesseract path
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+try:
+    import cv2  # type: ignore
+except ImportError:
+    print("Missing opencv-python. Please run: pip install opencv-python")
+    sys.exit(1)
 
 # ─────────────────────────────────────────────────────────────────
-# Database
+# App Metadata
+# ─────────────────────────────────────────────────────────────────
+APP_NAME    = "VETCScanner"
+APP_VERSION = "2.0.0"
+APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
+
+# Supported image file extensions
+_SUPPORTED_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp')
+
+# Image preview zoom constraints
+_MIN_ZOOM = 0.2
+_MAX_ZOOM = 5.0
+
+# Fallback preview panel dimensions (pixels) used when the widget has not yet been rendered
+_DEFAULT_PREVIEW_W = 780
+_DEFAULT_PREVIEW_H = 860
+
+# ─────────────────────────────────────────────────────────────────
+# Configuration Management
+# ─────────────────────────────────────────────────────────────────
+_CONFIG_DIR  = Path.home() / ".vetc_scanner"
+_CONFIG_FILE = _CONFIG_DIR / "config.json"
+_LOG_DIR     = _CONFIG_DIR / "logs"
+
+_DEFAULT_CONFIG: dict = {
+    "tesseract_path":     "",
+    "db_path":            str(_CONFIG_DIR / "receipts.db"),
+    "theme":              "Dark",
+    "color_theme":        "blue",
+    "last_directory":     "",
+    "auto_scan_on_load":  False,
+    "log_level":          "INFO",
+    "max_log_size_mb":    10,
+    "log_backup_count":   5,
+    "export_directory":   str(Path.home()),
+}
+
+
+def load_config() -> dict:
+    """Load config from disk, merging missing keys from defaults."""
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if _CONFIG_FILE.exists():
+        try:
+            with open(_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            for k, v in _DEFAULT_CONFIG.items():
+                cfg.setdefault(k, v)
+            return cfg
+        except Exception as exc:
+            print(f"WARNING: Could not load config ({exc}). Using defaults.")
+    return _DEFAULT_CONFIG.copy()
+
+
+def save_config(cfg: dict) -> None:
+    """Persist config to disk."""
+    try:
+        _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+    except Exception as exc:
+        logging.getLogger(APP_NAME).error("Failed to save config: %s", exc)
+
+
+_config = load_config()
+
+# ─────────────────────────────────────────────────────────────────
+# Logging Setup
 # ─────────────────────────────────────────────────────────────────
 
-def init_db():
-    try:
-        conn = sqlite3.connect('receipts.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS scans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                scan_time TEXT,
-                receipt_type TEXT,
-                transaction_code TEXT,
-                license_plate TEXT,
-                price TEXT,
-                status TEXT,
-                epc TEXT,
-                time_in TEXT,
-                station_in TEXT,
-                station_in_id TEXT,
-                lane_in TEXT,
-                time_out TEXT,
-                station_out TEXT,
-                station_out_id TEXT,
-                lane_out TEXT,
-                ticket_type TEXT,
-                unit TEXT,
-                raw_text TEXT
-            )
-        ''')
-        # Migrate: add columns that may be missing from older schema
-        new_columns = [
-            ("receipt_type", "TEXT"),
-            ("station_out",  "TEXT"),
-            ("lane_out",     "TEXT"),
-            ("ticket_type",  "TEXT"),
-            ("unit",         "TEXT"),
-        ]
-        existing = {row[1] for row in cursor.execute("PRAGMA table_info(scans)")}
-        for col_name, col_type in new_columns:
-            if col_name not in existing:
-                cursor.execute(f"ALTER TABLE scans ADD COLUMN {col_name} {col_type}")
-        conn.commit()
-    except Exception as e:
-        print(f"DB Error: {e}")
-    finally:
-        if 'conn' in locals():
-            conn.close()
+def _setup_logging(cfg: dict) -> logging.Logger:
+    log_level   = getattr(logging, cfg.get("log_level", "INFO"), logging.INFO)
+    log_path    = _LOG_DIR / f"{APP_NAME}.log"
+    max_bytes   = cfg.get("max_log_size_mb", 10) * 1024 * 1024
+    backup_cnt  = cfg.get("log_backup_count", 5)
 
-def save_to_db(data, raw_text, receipt_type="unknown"):
-    try:
-        conn = sqlite3.connect('receipts.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO scans (
-                scan_time, receipt_type, transaction_code, license_plate, price, status, epc,
-                time_in, station_in, station_in_id, lane_in,
-                time_out, station_out, station_out_id, lane_out,
-                ticket_type, unit, raw_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            receipt_type,
-            data.get('Mã giao dịch', ''),
-            data.get('Biển số', ''),
-            data.get('Giá tiền', ''),
-            data.get('Trạng thái', ''),
-            data.get('EPC', data.get('RFID', '')),
-            data.get('TG vào', data.get('Thời gian vào', '')),
-            data.get('Trạm vào', ''),
-            data.get('Id trạm vào', ''),
-            data.get('Làn vào', ''),
-            data.get('TG ra', data.get('Thời gian ra', '')),
-            data.get('Trạm ra', ''),
-            data.get('Id trạm ra', ''),
-            data.get('Làn ra', ''),
-            data.get('Loại vé', ''),
-            data.get('Đơn vị', ''),
-            raw_text
+    _log = logging.getLogger(APP_NAME)
+    _log.setLevel(log_level)
+    if not _log.handlers:
+        fh = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=max_bytes, backupCount=backup_cnt, encoding='utf-8'
+        )
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(funcName)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
         ))
-        conn.commit()
-    except Exception as e:
-        print(f"DB Save Error: {e}")
-    finally:
-        if 'conn' in locals():
-            conn.close()
+        ch = logging.StreamHandler()
+        ch.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        _log.addHandler(fh)
+        _log.addHandler(ch)
+    return _log
+
+
+logger = _setup_logging(_config)
+logger.info("Starting %s %s", APP_NAME, APP_VERSION)
+
+# ─────────────────────────────────────────────────────────────────
+# Tesseract Auto-Detection
+# ─────────────────────────────────────────────────────────────────
+_TESSERACT_CANDIDATES = [
+    r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+    r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+    '/usr/bin/tesseract',
+    '/usr/local/bin/tesseract',
+    '/opt/homebrew/bin/tesseract',
+]
+
+
+def configure_tesseract(cfg: dict) -> None:
+    """Set Tesseract binary path from config or auto-detect."""
+    tess_path = cfg.get("tesseract_path", "")
+    if tess_path and os.path.exists(tess_path):
+        pytesseract.pytesseract.tesseract_cmd = tess_path
+        logger.info("Tesseract set from config: %s", tess_path)
+        return
+    for p in _TESSERACT_CANDIDATES:
+        if os.path.exists(p):
+            pytesseract.pytesseract.tesseract_cmd = p
+            cfg["tesseract_path"] = p
+            logger.info("Tesseract auto-detected: %s", p)
+            return
+    logger.warning("Tesseract binary not found. Set path in Settings.")
+
+
+configure_tesseract(_config)
+
+# ─────────────────────────────────────────────────────────────────
+# Database Manager
+# ─────────────────────────────────────────────────────────────────
+
+class DatabaseManager:
+    """Thread-safe SQLite manager with schema migration and audit support."""
+
+    # Columns that must exist (added in v2 migrations)
+    _MIGRATE_COLUMNS = [
+        ("receipt_type",       "TEXT"),
+        ("station_out",        "TEXT"),
+        ("lane_out",           "TEXT"),
+        ("ticket_type",        "TEXT"),
+        ("unit",               "TEXT"),
+        ("processing_time_ms", "INTEGER"),
+        ("image_path",         "TEXT"),
+        ("ocr_engine",         "TEXT"),
+        ("ocr_confidence",     "REAL"),
+    ]
+
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        self._lock   = threading.Lock()
+        logger.info("DatabaseManager using: %s", db_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_schema(self) -> None:
+        """Create tables and run column migrations."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS scans (
+                        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                        scan_time          TEXT,
+                        receipt_type       TEXT,
+                        transaction_code   TEXT,
+                        license_plate      TEXT,
+                        price              TEXT,
+                        status             TEXT,
+                        epc                TEXT,
+                        time_in            TEXT,
+                        station_in         TEXT,
+                        station_in_id      TEXT,
+                        lane_in            TEXT,
+                        time_out           TEXT,
+                        station_out        TEXT,
+                        station_out_id     TEXT,
+                        lane_out           TEXT,
+                        ticket_type        TEXT,
+                        unit               TEXT,
+                        raw_text           TEXT,
+                        processing_time_ms INTEGER,
+                        image_path         TEXT,
+                        ocr_engine         TEXT,
+                        ocr_confidence     REAL
+                    )
+                ''')
+                existing = {row[1] for row in cur.execute("PRAGMA table_info(scans)")}
+                # Validate col_name/col_type against the known-safe whitelist before DDL
+                _valid_types = {"TEXT", "INTEGER", "REAL", "BLOB", "NUMERIC"}
+                for col_name, col_type in self._MIGRATE_COLUMNS:
+                    if col_name not in existing:
+                        if not re.match(r'^[a-z_]+$', col_name) or col_type.upper() not in _valid_types:
+                            logger.warning("Skipping unsafe migration column: %s %s", col_name, col_type)
+                            continue
+                        cur.execute(f"ALTER TABLE scans ADD COLUMN {col_name} {col_type}")
+                        logger.info("DB migration: added column '%s'", col_name)
+                conn.commit()
+                logger.info("Database schema ready.")
+            except Exception as exc:
+                logger.error("Schema init error: %s", exc)
+                raise
+            finally:
+                conn.close()
+
+    def save_scan(self, data: dict, raw_text: str, receipt_type: str = "unknown",
+                  processing_time_ms: int = 0, image_path: str = "",
+                  ocr_engine: str = "", ocr_confidence: float = 0.0) -> int:
+        """Insert one scan record. Returns new row id or -1 on error."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute('''
+                    INSERT INTO scans (
+                        scan_time, receipt_type, transaction_code, license_plate,
+                        price, status, epc,
+                        time_in, station_in, station_in_id, lane_in,
+                        time_out, station_out, station_out_id, lane_out,
+                        ticket_type, unit, raw_text,
+                        processing_time_ms, image_path, ocr_engine, ocr_confidence
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    receipt_type,
+                    data.get('Mã giao dịch', ''),
+                    data.get('Biển số', ''),
+                    data.get('Giá tiền', ''),
+                    data.get('Trạng thái', ''),
+                    data.get('EPC', data.get('RFID', '')),
+                    data.get('TG vào', data.get('Thời gian vào', '')),
+                    data.get('Trạm vào', ''),
+                    data.get('Id trạm vào', ''),
+                    data.get('Làn vào', ''),
+                    data.get('TG ra', data.get('Thời gian ra', '')),
+                    data.get('Trạm ra', ''),
+                    data.get('Id trạm ra', ''),
+                    data.get('Làn ra', ''),
+                    data.get('Loại vé', ''),
+                    data.get('Đơn vị', ''),
+                    raw_text,
+                    processing_time_ms,
+                    image_path,
+                    ocr_engine,
+                    ocr_confidence,
+                ))
+                conn.commit()
+                row_id = cur.lastrowid
+                logger.info("Scan saved — id=%d type=%s plate=%s time=%dms",
+                            row_id, receipt_type,
+                            data.get('Biển số', 'N/A'), processing_time_ms)
+                return row_id
+            except Exception as exc:
+                logger.error("DB save error: %s", exc)
+                return -1
+            finally:
+                conn.close()
+
+    def get_recent_scans(self, limit: int = 200, search: str = "") -> list:
+        """Return recent scan rows (dicts), optionally filtered by search term."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                if search:
+                    # Escape LIKE wildcards so user input is treated as literal text
+                    escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    q = f'%{escaped}%'
+                    cur.execute('''
+                        SELECT id, scan_time, receipt_type, transaction_code,
+                               license_plate, price, status, ocr_engine, ocr_confidence,
+                               processing_time_ms
+                        FROM scans
+                        WHERE transaction_code LIKE ? ESCAPE '\\'
+                           OR license_plate LIKE ? ESCAPE '\\'
+                           OR raw_text LIKE ? ESCAPE '\\'
+                        ORDER BY id DESC LIMIT ?
+                    ''', (q, q, q, limit))
+                else:
+                    cur.execute('''
+                        SELECT id, scan_time, receipt_type, transaction_code,
+                               license_plate, price, status, ocr_engine, ocr_confidence,
+                               processing_time_ms
+                        FROM scans ORDER BY id DESC LIMIT ?
+                    ''', (limit,))
+                return [dict(row) for row in cur.fetchall()]
+            except Exception as exc:
+                logger.error("DB query error: %s", exc)
+                return []
+            finally:
+                conn.close()
+
+    def get_statistics(self) -> dict:
+        """Return aggregate DB statistics."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) AS total FROM scans")
+                total = cur.fetchone()["total"]
+                cur.execute("SELECT receipt_type, COUNT(*) AS cnt FROM scans GROUP BY receipt_type")
+                by_type = {r["receipt_type"]: r["cnt"] for r in cur.fetchall()}
+                cur.execute("SELECT AVG(processing_time_ms) AS avg_ms FROM scans WHERE processing_time_ms > 0")
+                row = cur.fetchone()
+                avg_ms = row["avg_ms"] if row and row["avg_ms"] else 0.0
+                return {"total": total, "by_type": by_type, "avg_processing_ms": round(avg_ms)}
+            except Exception as exc:
+                logger.error("DB statistics error: %s", exc)
+                return {}
+            finally:
+                conn.close()
+
+    def export_all_csv(self, file_path: str) -> int:
+        """Dump all rows to CSV. Returns number of rows written."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM scans ORDER BY id")
+                rows = cur.fetchall()
+                if not rows:
+                    return 0
+                with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([d[0] for d in cur.description])
+                    writer.writerows(rows)
+                logger.info("Exported %d rows to CSV: %s", len(rows), file_path)
+                return len(rows)
+            except Exception as exc:
+                logger.error("CSV export error: %s", exc)
+                return 0
+            finally:
+                conn.close()
+
+
+# Singleton DB manager (path resolved after config is loaded)
+_db = DatabaseManager(_config["db_path"])
 
 # ─────────────────────────────────────────────────────────────────
 # EasyOCR — Lazy-load
 # ─────────────────────────────────────────────────────────────────
-_easyocr_reader = None
+_easyocr_reader    = None
 _easyocr_available = None
 
 def get_easyocr_reader():
@@ -129,16 +390,18 @@ def get_easyocr_reader():
             import warnings
             warnings.filterwarnings("ignore", category=UserWarning, module="torch")
             import easyocr  # type: ignore
-            _easyocr_reader = easyocr.Reader(['vi', 'en'], gpu=False, verbose=False)
+            _easyocr_reader    = easyocr.Reader(['vi', 'en'], gpu=False, verbose=False)
             _easyocr_available = True
-        except Exception:
+            logger.info("EasyOCR reader loaded successfully.")
+        except Exception as exc:
+            logger.warning("EasyOCR unavailable: %s", exc)
             _easyocr_available = False
             return None
     return _easyocr_reader
 
-# Configure CustomTkinter
-ctk.set_appearance_mode("Dark")
-ctk.set_default_color_theme("blue")
+# Apply CustomTkinter theme from config
+ctk.set_appearance_mode(_config.get("theme", "Dark"))
+ctk.set_default_color_theme(_config.get("color_theme", "blue"))
 
 # ─────────────────────────────────────────────────────────────────
 # Image Preprocessing
@@ -658,229 +921,559 @@ def parse_receipt(text):
 
 
 # ─────────────────────────────────────────────────────────────────
-# GUI
+# Settings Dialog
+# ─────────────────────────────────────────────────────────────────
+
+class SettingsDialog(ctk.CTkToplevel):
+    """Modal settings dialog for configuring application paths and options."""
+
+    def __init__(self, parent, cfg: dict, on_save):
+        super().__init__(parent)
+        self.title("⚙️ Settings")
+        self.geometry("560x480")
+        self.resizable(False, False)
+        self.grab_set()           # modal
+        self._cfg    = cfg
+        self._on_save = on_save
+
+        pad = dict(padx=20, pady=8)
+
+        ctk.CTkLabel(self, text="Application Settings",
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+
+        # Tesseract path
+        ctk.CTkLabel(self, text="Tesseract Binary Path:", anchor="w").pack(fill='x', **pad)
+        tess_frame = ctk.CTkFrame(self, fg_color="transparent")
+        tess_frame.pack(fill='x', padx=20, pady=0)
+        self._tess_var = ctk.StringVar(value=cfg.get("tesseract_path", ""))
+        ctk.CTkEntry(tess_frame, textvariable=self._tess_var).pack(side='left', fill='x', expand=True)
+        ctk.CTkButton(tess_frame, text="Browse", width=70,
+                      command=self._browse_tesseract).pack(side='left', padx=(6, 0))
+
+        # Database path
+        ctk.CTkLabel(self, text="Database File Path:", anchor="w").pack(fill='x', **pad)
+        db_frame = ctk.CTkFrame(self, fg_color="transparent")
+        db_frame.pack(fill='x', padx=20, pady=0)
+        self._db_var = ctk.StringVar(value=cfg.get("db_path", ""))
+        ctk.CTkEntry(db_frame, textvariable=self._db_var).pack(side='left', fill='x', expand=True)
+        ctk.CTkButton(db_frame, text="Browse", width=70,
+                      command=self._browse_db).pack(side='left', padx=(6, 0))
+
+        # Theme
+        ctk.CTkLabel(self, text="Appearance Theme:", anchor="w").pack(fill='x', **pad)
+        self._theme_var = ctk.StringVar(value=cfg.get("theme", "Dark"))
+        ctk.CTkOptionMenu(self, variable=self._theme_var,
+                          values=["Dark", "Light", "System"]).pack(fill='x', padx=20, pady=0)
+
+        # Log level
+        ctk.CTkLabel(self, text="Log Level:", anchor="w").pack(fill='x', **pad)
+        self._log_var = ctk.StringVar(value=cfg.get("log_level", "INFO"))
+        ctk.CTkOptionMenu(self, variable=self._log_var,
+                          values=["DEBUG", "INFO", "WARNING", "ERROR"]).pack(fill='x', padx=20, pady=0)
+
+        # Auto-scan toggle
+        self._auto_var = ctk.BooleanVar(value=cfg.get("auto_scan_on_load", False))
+        ctk.CTkCheckBox(self, text="Auto-scan first image when loading directory",
+                        variable=self._auto_var).pack(anchor='w', padx=20, pady=12)
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill='x', padx=20, pady=(10, 20))
+        ctk.CTkButton(btn_frame, text="💾 Save", fg_color="#10B981", hover_color="#059669",
+                      command=self._save).pack(side='left', expand=True, fill='x', padx=(0, 5))
+        ctk.CTkButton(btn_frame, text="✖ Cancel", fg_color="#6B7280", hover_color="#4B5563",
+                      command=self.destroy).pack(side='left', expand=True, fill='x', padx=(5, 0))
+
+    def _browse_tesseract(self):
+        path = ctk.filedialog.askopenfilename(
+            title="Select Tesseract Executable",
+            filetypes=[("Executables", "tesseract tesseract.exe *")]
+        )
+        if path:
+            self._tess_var.set(path)
+
+    def _browse_db(self):
+        path = ctk.filedialog.asksaveasfilename(
+            title="Select Database File",
+            defaultextension=".db",
+            filetypes=[("SQLite DB", "*.db")]
+        )
+        if path:
+            self._db_var.set(path)
+
+    def _save(self):
+        self._cfg["tesseract_path"]    = self._tess_var.get().strip()
+        self._cfg["db_path"]           = self._db_var.get().strip()
+        self._cfg["theme"]             = self._theme_var.get()
+        self._cfg["log_level"]         = self._log_var.get()
+        self._cfg["auto_scan_on_load"] = self._auto_var.get()
+        save_config(self._cfg)
+        if self._on_save:
+            self._on_save(self._cfg)
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────
+# History Dialog
+# ─────────────────────────────────────────────────────────────────
+
+class HistoryDialog(ctk.CTkToplevel):
+    """Browsable scan history from the database."""
+
+    _COLUMNS = ("id", "scan_time", "receipt_type", "transaction_code",
+                 "license_plate", "price", "status", "ocr_engine",
+                 "ocr_confidence", "processing_time_ms")
+    _HEADERS = ("ID", "Scan Time", "Type", "Transaction",
+                 "Plate", "Price", "Status", "Engine",
+                 "Conf%", "Time(ms)")
+
+    def __init__(self, parent, db: DatabaseManager):
+        super().__init__(parent)
+        self.title("📋 Scan History")
+        self.geometry("1100x560")
+        self._db = db
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill='x', padx=15, pady=10)
+        ctk.CTkLabel(top, text="Search:", anchor="w").pack(side='left')
+        self._search_var = ctk.StringVar()
+        search_entry = ctk.CTkEntry(top, textvariable=self._search_var, width=250)
+        search_entry.pack(side='left', padx=8)
+        ctk.CTkButton(top, text="🔍 Search", width=90,
+                      command=self._refresh).pack(side='left')
+        ctk.CTkButton(top, text="↺ Reset", width=80,
+                      command=self._reset).pack(side='left', padx=6)
+        ctk.CTkButton(top, text="📊 Export All CSV", fg_color="#B91C1C",
+                      hover_color="#991B1B", command=self._export_all_csv).pack(side='right')
+
+        # Treeview inside a frame
+        tree_frame = ctk.CTkFrame(self)
+        tree_frame.pack(fill='both', expand=True, padx=15, pady=(0, 15))
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", background="#1E1E2E", foreground="white",
+                        fieldbackground="#1E1E2E", rowheight=24,
+                        font=("Consolas", 11))
+        style.configure("Treeview.Heading", background="#374151",
+                        foreground="white", font=("Segoe UI", 11, "bold"))
+        style.map("Treeview", background=[("selected", "#3B82F6")])
+
+        self._tree = ttk.Treeview(tree_frame, columns=self._COLUMNS,
+                                   show="headings", selectmode="browse")
+        col_widths = (40, 140, 100, 110, 100, 80, 80, 140, 60, 75)
+        for col, hdr, w in zip(self._COLUMNS, self._HEADERS, col_widths):
+            self._tree.heading(col, text=hdr)
+            self._tree.column(col, width=w, anchor="w")
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",   command=self._tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side='right',  fill='y')
+        hsb.pack(side='bottom', fill='x')
+        self._tree.pack(fill='both', expand=True)
+
+        self._refresh()
+
+    def _refresh(self):
+        search = self._search_var.get().strip()
+        rows = self._db.get_recent_scans(limit=200, search=search)
+        self._tree.delete(*self._tree.get_children())
+        for r in rows:
+            conf_pct = f"{r.get('ocr_confidence', 0) * 100:.1f}" if r.get('ocr_confidence') else ""
+            self._tree.insert("", "end", values=(
+                r.get("id", ""),
+                r.get("scan_time", ""),
+                r.get("receipt_type", ""),
+                r.get("transaction_code", ""),
+                r.get("license_plate", ""),
+                r.get("price", ""),
+                r.get("status", ""),
+                r.get("ocr_engine", ""),
+                conf_pct,
+                r.get("processing_time_ms", ""),
+            ))
+
+    def _reset(self):
+        self._search_var.set("")
+        self._refresh()
+
+    def _export_all_csv(self):
+        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile=f"history_export_{ts}.csv",
+            filetypes=[("CSV files", "*.csv")]
+        )
+        if not path:
+            return
+        count = self._db.export_all_csv(path)
+        messagebox.showinfo("Export", f"Exported {count} records to:\n{path}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Enterprise GUI
 # ─────────────────────────────────────────────────────────────────
 
 class NextLevelOCRScanner(ctk.CTk):
+    """Enterprise-grade OCR scanner GUI with batch processing, history, and audit logging."""
+
     def __init__(self):
         super().__init__()
 
-        self.title("Toll Receipt OCR — VETC Scanner")
-        self.geometry("1300x800")
+        self.title(APP_TITLE)
+        self.geometry("1400x860")
+        self.minsize(1100, 700)
 
+        # ── State ──────────────────────────────────────────────
+        self.image_files: list       = []
+        self.file_buttons: dict      = {}
+        self.current_image_path: str = ""
+        self.latest_metadata: dict   = {}
+        self.latest_receipt_type     = "unknown"
+        self._scan_lock              = threading.Lock()
+        self._batch_running          = False
+        self._batch_cancel           = threading.Event()
+
+        # ── Layout ─────────────────────────────────────────────
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=4)
         self.grid_columnconfigure(2, weight=2)
         self.grid_rowconfigure(0, weight=1)
-        self.latest_metadata = None
-        self.latest_receipt_type = "unknown"
+        self.grid_rowconfigure(1, weight=0)   # status bar row
 
-        # --- LEFT PANEL ---
+        self._build_sidebar()
+        self._build_preview()
+        self._build_results()
+        self._build_statusbar()
+        self._bind_shortcuts()
+
+        # Restore last directory from config
+        last_dir = _config.get("last_directory", "")
+        if last_dir and os.path.isdir(last_dir):
+            self.load_directory(last_dir)
+
+        self.set_status(f"Ready — {APP_NAME} {APP_VERSION} | DB: {_config['db_path']}")
+        logger.info("GUI initialised.")
+
+    # ──────────────────────────────────────────────────────────
+    # Build helpers
+    # ──────────────────────────────────────────────────────────
+
+    def _build_sidebar(self):
         self.sidebar_frame = ctk.CTkFrame(self, corner_radius=10, fg_color="#1E293B")
-        self.sidebar_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.sidebar_frame.grid(row=0, column=0, rowspan=1, sticky="nsew", padx=10, pady=10)
 
-        self.logo_label = ctk.CTkLabel(
-            self.sidebar_frame, text="Receipt Scanner\nVETC PRO",
-            font=ctk.CTkFont(size=22, weight="bold")
-        )
-        self.logo_label.pack(pady=20, padx=20)
+        ctk.CTkLabel(
+            self.sidebar_frame,
+            text=f"VETC Enterprise\n{APP_VERSION}",
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).pack(pady=16, padx=16)
 
-        self.btn_select_dir = ctk.CTkButton(
-            self.sidebar_frame, text="📁 Load Directory",
-            fg_color="#3B82F6", hover_color="#2563EB",
-            command=lambda: self.load_directory()
-        )
-        self.btn_select_dir.pack(fill='x', padx=20, pady=10)
+        btns = [
+            ("📁 Load Directory", "#3B82F6", "#2563EB", lambda: self.load_directory()),
+            ("🖼️  Load File",      "#6366F1", "#4F46E5", self.load_file),
+            ("📦 Load ZIP",       "#F59E0B", "#D97706", self.load_zip_file),
+            ("⚡ Batch Scan All", "#10B981", "#059669", self.start_batch_scan),
+        ]
+        for text, fg, hov, cmd in btns:
+            ctk.CTkButton(
+                self.sidebar_frame, text=text,
+                fg_color=fg, hover_color=hov, command=cmd
+            ).pack(fill='x', padx=16, pady=5)
 
-        self.btn_select_file = ctk.CTkButton(
-            self.sidebar_frame, text="🖼️ Load File",
-            fg_color="#6366F1", hover_color="#4F46E5",
-            command=self.load_file
-        )
-        self.btn_select_file.pack(fill='x', padx=20, pady=10)
+        ctk.CTkFrame(self.sidebar_frame, height=1, fg_color="#334155").pack(
+            fill='x', padx=16, pady=10)
 
-        self.btn_load_zip = ctk.CTkButton(
-            self.sidebar_frame, text="📦 Load ZIP",
-            fg_color="#F59E0B", hover_color="#D97706",
-            command=self.load_zip_file
-        )
-        self.btn_load_zip.pack(fill='x', padx=20, pady=10)
+        ctk.CTkButton(
+            self.sidebar_frame, text="📋 History",
+            fg_color="#475569", hover_color="#334155",
+            command=self._open_history
+        ).pack(fill='x', padx=16, pady=5)
 
-        self.file_menu_label = ctk.CTkLabel(self.sidebar_frame, text="Available Images:")
-        self.file_menu_label.pack(pady=(20, 5), padx=20, anchor='w')
+        ctk.CTkButton(
+            self.sidebar_frame, text="⚙️  Settings",
+            fg_color="#374151", hover_color="#1F2937",
+            command=self._open_settings
+        ).pack(fill='x', padx=16, pady=5)
 
-        self.scrollable_file_list = ctk.CTkScrollableFrame(self.sidebar_frame, fg_color="transparent")
-        self.scrollable_file_list.pack(fill='both', expand=True, padx=20, pady=10)
+        ctk.CTkLabel(self.sidebar_frame,
+                     text="Images:", font=ctk.CTkFont(size=12)).pack(
+            pady=(14, 4), padx=16, anchor='w')
 
-        # --- MIDDLE PANEL ---
+        self.scrollable_file_list = ctk.CTkScrollableFrame(
+            self.sidebar_frame, fg_color="transparent")
+        self.scrollable_file_list.pack(fill='both', expand=True, padx=16, pady=(0, 10))
+
+        # Stats mini-label at bottom
+        self._stats_label = ctk.CTkLabel(
+            self.sidebar_frame, text="", font=ctk.CTkFont(size=10),
+            text_color="gray60", wraplength=180, justify="left")
+        self._stats_label.pack(pady=(4, 10), padx=16, anchor='w')
+        self._refresh_stats_label()
+
+    def _build_preview(self):
         self.preview_frame = ctk.CTkFrame(self, corner_radius=10)
-        self.preview_frame.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        self.preview_frame.grid(row=0, column=1, sticky="nsew", padx=0, pady=10)
+        self.preview_frame.grid_rowconfigure(1, weight=1)
+        self.preview_frame.grid_columnconfigure(0, weight=1)
 
-        self.preview_label = ctk.CTkLabel(self.preview_frame, text="No Image Selected", font=ctk.CTkFont(size=14))
-        self.preview_label.pack(fill='both', expand=True, padx=20, pady=20)
+        # Toolbar
+        tb = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
+        tb.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 0))
+        self._img_name_label = ctk.CTkLabel(tb, text="No image selected",
+                                             font=ctk.CTkFont(size=12, weight="bold"))
+        self._img_name_label.pack(side='left')
+        ctk.CTkButton(tb, text="🔍+", width=36,
+                      command=lambda: self._zoom(1.2)).pack(side='right', padx=2)
+        ctk.CTkButton(tb, text="🔍−", width=36,
+                      command=lambda: self._zoom(1 / 1.2)).pack(side='right', padx=2)
+        ctk.CTkButton(tb, text="⟳", width=36,
+                      command=self._zoom_reset).pack(side='right', padx=2)
 
-        # --- RIGHT PANEL ---
+        self.preview_label = ctk.CTkLabel(
+            self.preview_frame, text="No Image Selected",
+            font=ctk.CTkFont(size=14))
+        self.preview_label.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+
+        self._zoom_factor  = 1.0
+        self._base_pil_img = None
+
+    def _build_results(self):
         self.results_frame = ctk.CTkFrame(self, corner_radius=10)
         self.results_frame.grid(row=0, column=2, sticky="nsew", padx=10, pady=10)
         self.results_frame.grid_rowconfigure(1, weight=1)
         self.results_frame.grid_columnconfigure(0, weight=1)
 
-        self.results_title = ctk.CTkLabel(
-            self.results_frame, text="Scan Results",
-            font=ctk.CTkFont(size=20, weight="bold")
-        )
-        self.results_title.grid(row=0, column=0, pady=(20, 5), padx=20, sticky="w")
+        ctk.CTkLabel(self.results_frame, text="Scan Results",
+                     font=ctk.CTkFont(size=18, weight="bold")
+                     ).grid(row=0, column=0, pady=(16, 4), padx=20, sticky="w")
 
         self.tabview = ctk.CTkTabview(self.results_frame)
-        self.tabview.grid(row=1, column=0, sticky="nsew", padx=20, pady=5)
+        self.tabview.grid(row=1, column=0, sticky="nsew", padx=16, pady=4)
         self.tabview.add("Structured Data")
         self.tabview.add("Raw OCR Text")
 
-        self.tabview.tab("Structured Data").grid_rowconfigure(0, weight=1)
-        self.tabview.tab("Structured Data").grid_columnconfigure(0, weight=1)
-        self.smart_data_box = ctk.CTkTextbox(
-            self.tabview.tab("Structured Data"),
-            fg_color="#0F111A", text_color="#00FFAA",
-            font=ctk.CTkFont(family="Courier New", size=13),
-            corner_radius=8
-        )
-        self.smart_data_box.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.smart_data_box.insert("0.0", "--- No Data ---\nHit SCAN to extract structured receipt data.")
-        self.smart_data_box.configure(state="disabled")
+        for tab_name, fg, tc, init_text in [
+            ("Structured Data", "#0F111A", "#00FFAA",
+             "--- No Data ---\nHit SCAN to extract structured receipt data."),
+            ("Raw OCR Text",    "#1E1E1E", "white",
+             "Waiting for input...\n"),
+        ]:
+            tab = self.tabview.tab(tab_name)
+            tab.grid_rowconfigure(0, weight=1)
+            tab.grid_columnconfigure(0, weight=1)
+            box = ctk.CTkTextbox(tab, fg_color=fg, text_color=tc,
+                                  font=ctk.CTkFont(family="Courier New", size=12),
+                                  corner_radius=8)
+            box.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+            box.insert("0.0", init_text)
+            box.configure(state="disabled")
+            if tab_name == "Structured Data":
+                self.smart_data_box = box
+            else:
+                self.raw_data_box = box
 
-        self.tabview.tab("Raw OCR Text").grid_rowconfigure(0, weight=1)
-        self.tabview.tab("Raw OCR Text").grid_columnconfigure(0, weight=1)
-        self.raw_data_box = ctk.CTkTextbox(
-            self.tabview.tab("Raw OCR Text"),
-            fg_color="#1E1E1E", text_color="white",
-            font=ctk.CTkFont(size=12), corner_radius=8
-        )
-        self.raw_data_box.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.raw_data_box.insert("0.0", "Waiting for input...\n")
-        self.raw_data_box.configure(state="disabled")
-
+        # Progress
         self.progress_bar = ctk.CTkProgressBar(
             self.results_frame, mode="indeterminate",
-            height=4, fg_color="#333333", progress_color="#10B981"
-        )
-        self.progress_bar.grid(row=2, column=0, sticky="ew", padx=20, pady=(10, 0))
+            height=5, fg_color="#2D3748", progress_color="#10B981")
+        self.progress_bar.grid(row=2, column=0, sticky="ew", padx=16, pady=(6, 0))
         self.progress_bar.set(0)
 
-        self.actions_frame = ctk.CTkFrame(self.results_frame, fg_color="transparent")
-        self.actions_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=10)
-        self.actions_frame.grid_columnconfigure((0, 1), weight=1)
+        # Batch progress (determinate, hidden until batch starts)
+        self._batch_progress = ctk.CTkProgressBar(
+            self.results_frame, mode="determinate",
+            height=5, fg_color="#2D3748", progress_color="#F59E0B")
+        self._batch_progress.grid(row=3, column=0, sticky="ew", padx=16, pady=(2, 0))
+        self._batch_progress.set(0)
+        self._batch_progress.grid_remove()
+
+        # Action buttons row 1
+        af1 = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        af1.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 0))
+        af1.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.btn_copy = ctk.CTkButton(
-            self.actions_frame, text="📄 Copy Data",
+            af1, text="📄 Copy JSON",
             fg_color="#4B5563", hover_color="#374151",
-            command=self.copy_data_to_clipboard
-        )
-        self.btn_copy.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+            command=self.copy_data_to_clipboard)
+        self.btn_copy.grid(row=0, column=0, sticky="ew", padx=(0, 3))
 
-        self.btn_export = ctk.CTkButton(
-            self.actions_frame, text="📊 Export CSV",
+        self.btn_export_csv = ctk.CTkButton(
+            af1, text="📊 CSV",
             fg_color="#B91C1C", hover_color="#991B1B",
-            command=self.export_to_csv
-        )
-        self.btn_export.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+            command=self.export_to_csv)
+        self.btn_export_csv.grid(row=0, column=1, sticky="ew", padx=3)
 
+        self.btn_export_json = ctk.CTkButton(
+            af1, text="🗂 JSON",
+            fg_color="#7C3AED", hover_color="#6D28D9",
+            command=self.export_to_json)
+        self.btn_export_json.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+
+        # Scan button
         self.btn_scan = ctk.CTkButton(
-            self.results_frame, text="START SCAN 🚀",
-            font=ctk.CTkFont(size=16, weight="bold"),
-            height=50, fg_color="#10B981", hover_color="#059669",
-            corner_radius=8, command=self.start_scan_thread
-        )
-        self.btn_scan.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 20))
+            self.results_frame, text="▶  START SCAN  (Ctrl+S)",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            height=48, fg_color="#10B981", hover_color="#059669",
+            corner_radius=8, command=self.start_scan_thread)
+        self.btn_scan.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 16))
 
-        self.image_files = []
-        self.file_buttons = {}
-        self.current_image_path = None
+    def _build_statusbar(self):
+        self._status_bar = ctk.CTkFrame(self, height=28, corner_radius=0,
+                                         fg_color="#111827")
+        self._status_bar.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._status_label = ctk.CTkLabel(
+            self._status_bar, text="Initialising…",
+            font=ctk.CTkFont(size=11), text_color="#9CA3AF", anchor="w")
+        self._status_label.pack(side='left', padx=12)
+        self._clock_label = ctk.CTkLabel(
+            self._status_bar, text="",
+            font=ctk.CTkFont(size=11), text_color="#6B7280", anchor="e")
+        self._clock_label.pack(side='right', padx=12)
+        self._tick_clock()
 
-        if os.path.exists(r"C:\Users\ETC\Downloads\2303"):
-            self.load_directory(r"C:\Users\ETC\Downloads\2303")
+    def _bind_shortcuts(self):
+        self.bind("<Control-o>", lambda e: self.load_directory())
+        self.bind("<Control-O>", lambda e: self.load_directory())
+        self.bind("<Control-s>", lambda e: self.start_scan_thread())
+        self.bind("<Control-S>", lambda e: self.start_scan_thread())
+        self.bind("<Control-e>", lambda e: self.export_to_csv())
+        self.bind("<Control-E>", lambda e: self.export_to_csv())
+        self.bind("<Control-h>", lambda e: self._open_history())
+        self.bind("<Control-H>", lambda e: self._open_history())
 
-    def load_directory(self, dir_path=None):
+    # ──────────────────────────────────────────────────────────
+    # Clock / Status helpers
+    # ──────────────────────────────────────────────────────────
+
+    def _tick_clock(self):
+        self._clock_label.configure(
+            text=datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
+        self.after(1000, self._tick_clock)
+
+    def set_status(self, msg: str):
+        self._status_label.configure(text=msg)
+        logger.debug("Status: %s", msg)
+
+    # ──────────────────────────────────────────────────────────
+    # Image management
+    # ──────────────────────────────────────────────────────────
+
+    def load_directory(self, dir_path: str = ""):
         if not dir_path:
             dir_path = ctk.filedialog.askdirectory()
-        if dir_path:
-            for widget in self.scrollable_file_list.winfo_children():
-                widget.destroy()
-
-            self.image_files = []
-            self.file_buttons = {}
-            for f in sorted(os.listdir(dir_path)):
-                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
-                    full_path = os.path.join(dir_path, f)
-                    self.image_files.append(full_path)
-
-            for path in self.image_files:
-                fname = os.path.basename(path)
-                btn = ctk.CTkButton(
-                    self.scrollable_file_list, text=fname,
-                    anchor="w", fg_color="transparent",
-                    text_color="white", hover_color="gray50",
-                    command=lambda p=path: self.display_image(p)
-                )
-                btn.pack(fill='x', pady=2)
-                self.file_buttons[path] = btn
-
-            if self.image_files:
-                self.display_image(self.image_files[0])
+        if not dir_path:
+            return
+        _config["last_directory"] = dir_path
+        save_config(_config)
+        for w in self.scrollable_file_list.winfo_children():
+            w.destroy()
+        self.image_files  = []
+        self.file_buttons = {}
+        for f in sorted(os.listdir(dir_path)):
+            if f.lower().endswith(_SUPPORTED_EXTENSIONS):
+                self.image_files.append(os.path.join(dir_path, f))
+        for path in self.image_files:
+            self._add_file_button(path)
+        n = len(self.image_files)
+        self.set_status(f"Loaded {n} image{'s' if n != 1 else ''} from: {dir_path}")
+        logger.info("Directory loaded: %s (%d images)", dir_path, n)
+        if self.image_files:
+            self.display_image(self.image_files[0])
+            if _config.get("auto_scan_on_load"):
+                self.start_scan_thread()
 
     def load_file(self):
-        file_path = ctk.filedialog.askopenfilename(
-            filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.bmp;*.tiff")]
+        ext_str = " ".join(f"*{e}" for e in _SUPPORTED_EXTENSIONS)
+        path = ctk.filedialog.askopenfilename(
+            filetypes=[("Image Files", ext_str)]
         )
-        if file_path:
-            for widget in self.scrollable_file_list.winfo_children():
-                widget.destroy()
-            self.image_files = [file_path]
-            self.file_buttons = {}
-            fname = os.path.basename(file_path)
-            btn = ctk.CTkButton(
-                self.scrollable_file_list, text=fname,
-                anchor="w", fg_color="transparent",
-                text_color="white", hover_color="gray50",
-                command=lambda p=file_path: self.display_image(p)
-            )
-            btn.pack(fill='x', pady=2)
-            self.file_buttons[file_path] = btn
-            self.display_image(file_path)
+        if not path:
+            return
+        for w in self.scrollable_file_list.winfo_children():
+            w.destroy()
+        self.image_files  = [path]
+        self.file_buttons = {}
+        self._add_file_button(path)
+        self.display_image(path)
+        self.set_status(f"File loaded: {os.path.basename(path)}")
 
     def load_zip_file(self):
         zip_path = ctk.filedialog.askopenfilename(filetypes=[("ZIP Archives", "*.zip")])
-        if zip_path:
-            extract_dir = os.path.splitext(zip_path)[0] + "_extracted"
-            try:
-                if os.path.exists(extract_dir):
-                    shutil.rmtree(extract_dir)
-                os.makedirs(extract_dir, exist_ok=True)
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(extract_dir)
-                self.load_directory(extract_dir)
-            except Exception as e:
-                import tkinter.messagebox as messagebox
-                messagebox.showerror("Error", f"Failed to extract ZIP:\n{e}")
-
-    def display_image(self, path):
-        self.current_image_path = path
-
-        for p, btn in self.file_buttons.items():
-            btn.configure(fg_color="gray30" if p == path else "transparent")
-
+        if not zip_path:
+            return
+        extract_dir = os.path.splitext(zip_path)[0] + "_extracted"
         try:
-            img = Image.open(path)
-            img.thumbnail((800, 900), Image.Resampling.LANCZOS)
-            tk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(img.width, img.height))
-            self.preview_label.configure(image=tk_img, text="")
-            self.preview_label.image = tk_img
+            if os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir)
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(extract_dir)
+            self.load_directory(extract_dir)
+            logger.info("ZIP extracted to: %s", extract_dir)
+        except Exception as exc:
+            logger.error("ZIP extraction failed: %s", exc)
+            messagebox.showerror("Error", f"Failed to extract ZIP:\n{exc}")
 
-            self.update_textbox(self.smart_data_box, "--- Ready to parse ---\nClick START SCAN to begin.")
+    def _add_file_button(self, path: str):
+        btn = ctk.CTkButton(
+            self.scrollable_file_list, text=os.path.basename(path),
+            anchor="w", fg_color="transparent",
+            text_color="white", hover_color="gray40",
+            command=lambda p=path: self.display_image(p)
+        )
+        btn.pack(fill='x', pady=1)
+        self.file_buttons[path] = btn
+
+    def display_image(self, path: str):
+        self.current_image_path = path
+        for p, btn in self.file_buttons.items():
+            btn.configure(fg_color="gray25" if p == path else "transparent")
+        try:
+            self._base_pil_img = Image.open(path)
+            self._zoom_factor  = 1.0
+            self._render_image()
+            self._img_name_label.configure(text=os.path.basename(path))
+            self.update_textbox(self.smart_data_box,
+                                "--- Ready ---\nPress START SCAN or Ctrl+S.")
             self.update_textbox(self.raw_data_box, "Image loaded. Ready for OCR.")
-        except Exception as e:
-            self.preview_label.configure(image=None, text=f"Error: {e}")
+            self.set_status(f"Preview: {os.path.basename(path)}")
+        except Exception as exc:
+            logger.error("display_image error: %s", exc)
+            self.preview_label.configure(image=None, text=f"Cannot open image:\n{exc}")
 
-    def update_textbox(self, textbox, text):
+    def _render_image(self):
+        if self._base_pil_img is None:
+            return
+        img = self._base_pil_img.copy()
+        w   = int(img.width  * self._zoom_factor)
+        h   = int(img.height * self._zoom_factor)
+        max_w = self.preview_frame.winfo_width()  or _DEFAULT_PREVIEW_W
+        max_h = self.preview_frame.winfo_height() or _DEFAULT_PREVIEW_H
+        if w > max_w or h > max_h:
+            img.thumbnail((max_w - 20, max_h - 60), Image.Resampling.LANCZOS)
+        else:
+            img = img.resize((w, h), Image.Resampling.LANCZOS)
+        tk_img = ctk.CTkImage(light_image=img, dark_image=img,
+                               size=(img.width, img.height))
+        self.preview_label.configure(image=tk_img, text="")
+        self.preview_label.image = tk_img
+
+    def _zoom(self, factor: float):
+        self._zoom_factor = max(_MIN_ZOOM, min(self._zoom_factor * factor, _MAX_ZOOM))
+        self._render_image()
+
+    def _zoom_reset(self):
+        self._zoom_factor = 1.0
+        self._render_image()
+
+    # ──────────────────────────────────────────────────────────
+    # Single Scan
+    # ──────────────────────────────────────────────────────────
+
+    def update_textbox(self, textbox, text: str):
         textbox.configure(state="normal")
         textbox.delete("0.0", "end")
         textbox.insert("0.0", text)
@@ -888,141 +1481,337 @@ class NextLevelOCRScanner(ctk.CTk):
 
     def start_scan_thread(self):
         if not self.current_image_path:
+            self.set_status("⚠️  No image selected.")
             return
-        self.btn_scan.configure(state="disabled", text="SCANNING...")
+        if self._batch_running:
+            self.set_status("⚠️  Batch scan in progress. Please wait.")
+            return
+        if not self._scan_lock.acquire(blocking=False):
+            return
+        self.btn_scan.configure(state="disabled", text="⏳ SCANNING…")
         self.progress_bar.start()
-        self.update_textbox(
-            self.smart_data_box,
-            "🔬 Đang chạy Dual-Engine OCR...\n\n"
-            "• Tesseract LSTM (cấu trúc dòng)\n"
-            "• EasyOCR CRNN  (nhận dạng ký tự)\n\n"
-            "Lần đầu EasyOCR cần tải model (~1 phút)..."
-        )
-        self.update_textbox(self.raw_data_box, "⚙️ Đang xử lý...")
-        t = threading.Thread(target=self.run_ocr_scan)
-        t.daemon = True
+        self.update_textbox(self.smart_data_box,
+                            "🔬 Running Dual-Engine OCR…\n\n"
+                            "• Tesseract LSTM\n"
+                            "• EasyOCR CRNN\n\n"
+                            "First run: EasyOCR may take ~1 min to load model…")
+        self.update_textbox(self.raw_data_box, "⚙️  Processing…")
+        self.set_status(f"Scanning: {os.path.basename(self.current_image_path)}")
+        t = threading.Thread(target=self._run_single_scan,
+                              args=(self.current_image_path,), daemon=True)
         t.start()
 
-    def run_ocr_scan(self):
+    def _run_single_scan(self, image_path: str):
+        t0 = time.time()
         try:
-            original_img = Image.open(self.current_image_path)
+            original_img = Image.open(image_path)
+            img_tess     = preprocess_image(original_img)
+            img_easy     = preprocess_for_easyocr(original_img)
 
-            # Preprocessing riêng cho mỗi engine
-            img_tess = preprocess_image(original_img)
-            img_easy = preprocess_for_easyocr(original_img)
-
-            tess_text = ""
-            easy_text = ""
-            easy_conf = 0.0
-            engine_label = "Tesseract"
-
-            def run_tesseract_task():
-                return run_tesseract(img_tess)
-
-            def run_easyocr_task():
-                return run_easyocr(img_easy)
-
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                fut_tess = executor.submit(run_tesseract_task)
-                fut_easy = executor.submit(run_easyocr_task)
-                tess_text = fut_tess.result()
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fut_tess = ex.submit(run_tesseract, img_tess)
+                fut_easy = ex.submit(run_easyocr,   img_easy)
+                tess_text            = fut_tess.result()
                 easy_text, easy_conf, _ = fut_easy.result()
 
             if easy_text.strip():
-                engine_label = f"Tesseract + EasyOCR ✅  (conf: {easy_conf * 100:.1f}%)"
+                engine_label   = f"Tesseract + EasyOCR ✅ (conf: {easy_conf * 100:.1f}%)"
                 extracted_text = merge_dual_ocr(tess_text, easy_text, easy_conf)
             else:
-                engine_label = "Tesseract only"
+                engine_label   = "Tesseract only"
+                easy_conf      = 0.0
                 extracted_text = tess_text
 
-            # Parse
             metadata, receipt_type = parse_receipt(extracted_text)
-
-            # Save
-            if metadata:
-                save_to_db(metadata, extracted_text, receipt_type)
-
-            # Format output
-            type_label = {
-                "type1_web": "🌐 Loại 1 — Giao diện web (nhãn dọc)",
-                "type2_vetc": "📱 Loại 2 — VETC App (key:value)",
-            }.get(receipt_type, "❓ Không xác định")
-
-            smart_out = f"🔬 Engine: {engine_label}\n"
-            smart_out += f"📋 Loại hóa đơn: {type_label}\n"
-            smart_out += "─" * 40 + "\n\n"
+            elapsed_ms = int((time.time() - t0) * 1000)
 
             if metadata:
-                for key, val in metadata.items():
-                    smart_out += f"► {key}:\n   [ {val} ]\n\n"
-            else:
-                smart_out += "Không tìm thấy dữ liệu hóa đơn. Hãy kiểm tra Raw OCR Text."
+                _db.save_scan(
+                    metadata, extracted_text, receipt_type,
+                    processing_time_ms=elapsed_ms,
+                    image_path=image_path,
+                    ocr_engine=engine_label,
+                    ocr_confidence=easy_conf,
+                )
 
-            raw_out = "=== MERGED OCR TEXT ===\n"
-            raw_out += extracted_text.strip() if extracted_text.strip() else "[No text found]"
-            if easy_text.strip():
-                raw_out += "\n\n=== EASYOCR RAW ===\n" + easy_text.strip()
+            smart_out, raw_out = self._format_output(
+                engine_label, receipt_type, metadata, extracted_text,
+                easy_text, elapsed_ms)
 
-            self.after(0, self._finish_scan_sync, smart_out.strip(), raw_out, metadata, receipt_type)
+            self.after(0, self._finish_single_scan,
+                       smart_out, raw_out, metadata, receipt_type,
+                       elapsed_ms, engine_label)
 
-        except pytesseract.TesseractError as e:
-            if 'Failed loading language' in str(e):
-                err_msg = "Language Pack Error: vie.traineddata missing!"
-            else:
-                err_msg = str(e)
-            self.after(0, self._finish_scan_sync, "ERROR\n" + err_msg, err_msg, None, "unknown")
-        except Exception as e:
-            self.after(0, self._finish_scan_sync, "CRITICAL ERROR\n" + str(e), str(e), None, "unknown")
+        except pytesseract.TesseractError as exc:
+            err = ("Language pack 'vie.traineddata' missing!"
+                   if 'Failed loading language' in str(exc) else str(exc))
+            logger.error("Tesseract error on %s: %s", image_path, err)
+            self.after(0, self._finish_single_scan,
+                       f"ERROR\n{err}", err, None, "unknown", 0, "")
+        except Exception as exc:
+            logger.error("Scan error on %s: %s", image_path, exc, exc_info=True)
+            self.after(0, self._finish_single_scan,
+                       f"CRITICAL ERROR\n{exc}", str(exc), None, "unknown", 0, "")
 
-    def _finish_scan_sync(self, smart_text, raw_text, metadata, receipt_type):
+    def _format_output(self, engine_label, receipt_type, metadata,
+                       extracted_text, easy_text, elapsed_ms):
+        type_label = {
+            "type1_web":   "🌐 Type 1 — Web UI (vertical labels)",
+            "type2_vetc":  "📱 Type 2 — VETC App (key:value)",
+        }.get(receipt_type, "❓ Unknown")
+
+        smart = (f"🔬 Engine:  {engine_label}\n"
+                 f"📋 Type:    {type_label}\n"
+                 f"⏱  Time:    {elapsed_ms} ms\n"
+                 + "─" * 40 + "\n\n")
+        if metadata:
+            for k, v in metadata.items():
+                smart += f"► {k}:\n   [ {v} ]\n\n"
+        else:
+            smart += "No receipt data found. Check Raw OCR Text tab."
+
+        raw = "=== MERGED OCR TEXT ===\n"
+        raw += extracted_text.strip() or "[No text found]"
+        if easy_text.strip():
+            raw += "\n\n=== EASYOCR RAW ===\n" + easy_text.strip()
+
+        return smart.strip(), raw
+
+    def _finish_single_scan(self, smart_text, raw_text, metadata,
+                             receipt_type, elapsed_ms, engine_label):
         self.update_textbox(self.smart_data_box, smart_text)
-        self.update_textbox(self.raw_data_box, raw_text)
-        self.latest_metadata = metadata
+        self.update_textbox(self.raw_data_box,   raw_text)
+        self.latest_metadata     = metadata or {}
         self.latest_receipt_type = receipt_type
         self.progress_bar.stop()
         self.progress_bar.set(0)
-        self.btn_scan.configure(state="normal", text="START SCAN 🚀")
+        self.btn_scan.configure(state="normal", text="▶  START SCAN  (Ctrl+S)")
+        self._scan_lock.release()
+        self._refresh_stats_label()
+        status = (f"✅ Done in {elapsed_ms} ms | "
+                  f"Engine: {engine_label} | "
+                  f"Fields: {len(metadata) if metadata else 0}")
+        self.set_status(status)
+        logger.info("Single scan done: %dms, fields=%d",
+                    elapsed_ms, len(metadata) if metadata else 0)
+
+    # ──────────────────────────────────────────────────────────
+    # Batch Scan
+    # ──────────────────────────────────────────────────────────
+
+    def start_batch_scan(self):
+        if not self.image_files:
+            messagebox.showwarning("No Images", "Load a directory or file first.")
+            return
+        if self._batch_running:
+            # Cancel running batch
+            self._batch_cancel.set()
+            self.set_status("⛔ Cancelling batch…")
+            return
+        self._batch_running = True
+        self._batch_cancel.clear()
+        self._batch_progress.grid()
+        self._batch_progress.set(0)
+        self.btn_scan.configure(state="disabled")
+        self.set_status(f"⚡ Batch scan started: {len(self.image_files)} images")
+        logger.info("Batch scan started: %d images", len(self.image_files))
+        t = threading.Thread(target=self._run_batch_scan, daemon=True)
+        t.start()
+
+    def _run_batch_scan(self):
+        total   = len(self.image_files)
+        success = 0
+        failed  = 0
+        t_start = time.time()
+
+        for idx, image_path in enumerate(self.image_files):
+            if self._batch_cancel.is_set():
+                break
+            progress = idx / total
+            self.after(0, self._batch_progress.set, progress)
+            self.after(0, self.set_status,
+                       f"⚡ Batch [{idx + 1}/{total}]: {os.path.basename(image_path)}")
+
+            try:
+                original_img = Image.open(image_path)
+                img_tess     = preprocess_image(original_img)
+                img_easy     = preprocess_for_easyocr(original_img)
+                t0 = time.time()
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    tess_text            = ex.submit(run_tesseract, img_tess).result()
+                    easy_text, conf, _   = ex.submit(run_easyocr,   img_easy).result()
+                elapsed_ms = int((time.time() - t0) * 1000)
+
+                if easy_text.strip():
+                    engine_lbl     = f"Dual (conf {conf * 100:.0f}%)"
+                    extracted_text = merge_dual_ocr(tess_text, easy_text, conf)
+                else:
+                    engine_lbl     = "Tesseract"
+                    conf           = 0.0
+                    extracted_text = tess_text
+
+                metadata, receipt_type = parse_receipt(extracted_text)
+                if metadata:
+                    _db.save_scan(metadata, extracted_text, receipt_type,
+                                  processing_time_ms=elapsed_ms,
+                                  image_path=image_path,
+                                  ocr_engine=engine_lbl,
+                                  ocr_confidence=conf)
+                success += 1
+
+                # Show last image in preview
+                self.after(0, self.display_image, image_path)
+
+            except Exception as exc:
+                failed += 1
+                logger.error("Batch scan error on %s: %s", image_path, exc)
+
+        elapsed_total = int(time.time() - t_start)
+        self.after(0, self._finish_batch_scan, total, success, failed, elapsed_total)
+
+    def _finish_batch_scan(self, total, success, failed, elapsed_total):
+        self._batch_running = False
+        self._batch_cancel.clear()
+        self._batch_progress.set(1)
+        self.btn_scan.configure(state="normal", text="▶  START SCAN  (Ctrl+S)")
+        self._refresh_stats_label()
+        msg = (f"⚡ Batch complete: {success}/{total} OK, "
+               f"{failed} failed — {elapsed_total}s total")
+        self.set_status(msg)
+        logger.info("Batch scan done: %d/%d OK, %d failed, %ds",
+                    success, total, failed, elapsed_total)
+        messagebox.showinfo("Batch Complete",
+                            f"Processed {total} images\n"
+                            f"✅ Success: {success}\n"
+                            f"❌ Failed:  {failed}\n"
+                            f"⏱  Total:   {elapsed_total}s")
+        self.after(3000, self._batch_progress.grid_remove)
+
+    # ──────────────────────────────────────────────────────────
+    # Export / Clipboard
+    # ──────────────────────────────────────────────────────────
 
     def copy_data_to_clipboard(self):
-        metadata = getattr(self, 'latest_metadata', None)
-        if metadata:
-            text_to_copy = json.dumps(metadata, ensure_ascii=False, indent=4)
+        if self.latest_metadata:
             self.clipboard_clear()
-            self.clipboard_append(text_to_copy)
-            original = self.btn_copy.cget("text")
-            self.btn_copy.configure(text="✅ Copied!")
-            self.after(2000, lambda: self.btn_copy.configure(text=original))
+            self.clipboard_append(
+                json.dumps(self.latest_metadata, ensure_ascii=False, indent=4))
+            self._flash_button(self.btn_copy, "✅ Copied!", "📄 Copy JSON")
+            self.set_status("Data copied to clipboard.")
         else:
-            self.btn_copy.configure(text="⚠️ No Data")
-            self.after(2000, lambda: self.btn_copy.configure(text="📄 Copy Data"))
+            self._flash_button(self.btn_copy, "⚠️ No Data", "📄 Copy JSON")
 
     def export_to_csv(self):
-        metadata = getattr(self, 'latest_metadata', None)
-        if not metadata:
-            self.btn_export.configure(text="⚠️ No Data")
-            self.after(2000, lambda: self.btn_export.configure(text="📊 Export CSV"))
+        if not self.latest_metadata:
+            self._flash_button(self.btn_export_csv, "⚠️ No Data", "📊 CSV")
             return
-
-        default_name = f"receipt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        file_path = ctk.filedialog.asksaveasfilename(
-            defaultextension=".csv", initialfile=default_name,
+        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile=f"receipt_{ts}.csv",
             filetypes=[("CSV files", "*.csv")]
         )
-        if file_path:
-            try:
-                with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(metadata.keys())
-                    writer.writerow(metadata.values())
-                original = self.btn_export.cget("text")
-                self.btn_export.configure(text="✅ Exported!")
-                self.after(2000, lambda: self.btn_export.configure(text=original))
-            except Exception as e:
-                import tkinter.messagebox as messagebox
-                messagebox.showerror("Export Error", f"Failed:\n{e}")
+        if not path:
+            return
+        try:
+            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f)
+                w.writerow(self.latest_metadata.keys())
+                w.writerow(self.latest_metadata.values())
+            self._flash_button(self.btn_export_csv, "✅ Saved!", "📊 CSV")
+            self.set_status(f"CSV exported: {path}")
+            logger.info("CSV exported: %s", path)
+        except Exception as exc:
+            logger.error("CSV export error: %s", exc)
+            messagebox.showerror("Export Error", f"Failed:\n{exc}")
 
+    def export_to_json(self):
+        if not self.latest_metadata:
+            self._flash_button(self.btn_export_json, "⚠️ No Data", "🗂 JSON")
+            return
+        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=f"receipt_{ts}.json",
+            filetypes=[("JSON files", "*.json")]
+        )
+        if not path:
+            return
+        try:
+            payload = {
+                "exported_at":   datetime.now().isoformat(),
+                "app_version":   APP_VERSION,
+                "receipt_type":  self.latest_receipt_type,
+                "fields":        self.latest_metadata,
+            }
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=4)
+            self._flash_button(self.btn_export_json, "✅ Saved!", "🗂 JSON")
+            self.set_status(f"JSON exported: {path}")
+            logger.info("JSON exported: %s", path)
+        except Exception as exc:
+            logger.error("JSON export error: %s", exc)
+            messagebox.showerror("Export Error", f"Failed:\n{exc}")
+
+    def _flash_button(self, btn, temp_text: str, orig_text: str, delay: int = 2000):
+        btn.configure(text=temp_text)
+        self.after(delay, lambda: btn.configure(text=orig_text))
+
+    # ──────────────────────────────────────────────────────────
+    # Dialogs
+    # ──────────────────────────────────────────────────────────
+
+    def _open_history(self):
+        HistoryDialog(self, _db)
+
+    def _open_settings(self):
+        SettingsDialog(self, _config, on_save=self._apply_settings)
+
+    def _apply_settings(self, cfg: dict):
+        ctk.set_appearance_mode(cfg.get("theme", "Dark"))
+        configure_tesseract(cfg)
+        # Reinitialise DB if path changed; guard against concurrent scans
+        global _db
+        if _db.db_path != cfg["db_path"]:
+            if self._batch_running or not self._scan_lock.acquire(blocking=False):
+                messagebox.showwarning(
+                    "Settings",
+                    "Cannot change DB path while a scan is running.\n"
+                    "Please wait for the current operation to finish.")
+                return
+            try:
+                _db = DatabaseManager(cfg["db_path"])
+                _db.init_schema()
+            finally:
+                self._scan_lock.release()
+        log_level = getattr(logging, cfg.get("log_level", "INFO"), logging.INFO)
+        logging.getLogger(APP_NAME).setLevel(log_level)
+        self.set_status("Settings applied.")
+        logger.info("Settings applied: theme=%s, tess=%s, db=%s",
+                    cfg.get("theme"), cfg.get("tesseract_path"), cfg.get("db_path"))
+
+    # ──────────────────────────────────────────────────────────
+    # Stats
+    # ──────────────────────────────────────────────────────────
+
+    def _refresh_stats_label(self):
+        stats = _db.get_statistics()
+        if stats:
+            lines = [f"Total scans: {stats.get('total', 0)}"]
+            for rtype, cnt in stats.get("by_type", {}).items():
+                lines.append(f"  {rtype}: {cnt}")
+            avg = stats.get("avg_processing_ms", 0)
+            if avg is not None and avg:
+                lines.append(f"Avg time: {avg:.0f} ms")
+            self._stats_label.configure(text="\n".join(lines))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    init_db()
+    _db.init_schema()
     app = NextLevelOCRScanner()
     app.mainloop()
+
