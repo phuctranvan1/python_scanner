@@ -41,7 +41,7 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "3.0.0"
+APP_VERSION = "4.0.0"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
 
 # Supported image file extensions
@@ -196,6 +196,39 @@ def configure_tesseract(cfg: dict) -> None:
 
 
 configure_tesseract(_config)
+
+# ─────────────────────────────────────────────────────────────────
+# PIL Image Cache
+# ─────────────────────────────────────────────────────────────────
+_PIL_IMAGE_CACHE: dict = {}   # path → (mtime: float, img: PIL.Image)
+_PIL_IMAGE_CACHE_MAX = 20     # maximum number of images kept in memory
+
+
+def _open_image_cached(path: str) -> Image.Image:
+    """Open a PIL Image with a path+mtime LRU cache to avoid redundant disk reads.
+
+    Caching is most impactful when navigating quickly through an already-loaded
+    directory, or when a scan immediately follows a display of the same file.
+    Returns a *copy* of the cached image so callers can modify it freely.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return Image.open(path)
+
+    cached = _PIL_IMAGE_CACHE.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1].copy()
+
+    img = Image.open(path)
+    img.load()  # ensure fully decoded before caching
+
+    # Evict oldest entry when at capacity (dict preserves insertion order, Python 3.7+)
+    if len(_PIL_IMAGE_CACHE) >= _PIL_IMAGE_CACHE_MAX:
+        del _PIL_IMAGE_CACHE[next(iter(_PIL_IMAGE_CACHE))]
+    _PIL_IMAGE_CACHE[path] = (mtime, img.copy())
+    return img
+
 
 # ─────────────────────────────────────────────────────────────────
 # Database Manager
@@ -870,8 +903,8 @@ def correct_numeric_ocr(text):
     """Sửa các ký tự bị nhận nhầm trong trường thuần số."""
     text = re.sub(r'[,.\-]', '', text)
     mapping = {
-        'O': '0', 'o': '0', 'D': '0', 'Q': '0', 'C': '0',
-        'l': '1', 'I': '1', 'i': '1', '|': '1', ']': '1', '[': '1', 't': '1',
+        'O': '0', 'o': '0', 'D': '0', 'Q': '0', 'C': '0', 'U': '0',
+        'l': '1', 'I': '1', 'i': '1', '|': '1', ']': '1', '[': '1', 't': '1', 'j': '1',
         'Z': '2', 'z': '2',
         'A': '4', 'h': '4',
         'S': '5', 's': '5',
@@ -904,12 +937,19 @@ def correct_hex_ocr(text):
 
 def normalize_datetime(text):
     """Chuẩn hoá chuỗi thời gian về dạng DD/MM/YYYY HH:MM:SS."""
-    # Xoá các ký tự dư thừa do OCR
     text = text.strip()
     # Thay thế dấu phân cách thời gian bị nhận sai
     text = re.sub(r'[,;|]', ':', text)
-    # Đảm bảo dấu / trong ngày
+    # Đảm bảo dấu / trong ngày — DD-MM-YYYY or DD.MM.YYYY → DD/MM/YYYY
     text = re.sub(r'(\d{2})[-.](\d{2})[-.](\d{4})', r'\1/\2/\3', text)
+    # ISO format YYYY-MM-DD HH:MM:SS → DD/MM/YYYY HH:MM:SS
+    text = re.sub(
+        r'(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2}:\d{2})',
+        r'\3/\2/\1 \4', text)
+    # YYYY-MM-DD without time
+    text = re.sub(r'(\d{4})-(\d{2})-(\d{2})$', r'\3/\2/\1', text)
+    # Normalise time separators mistakenly written as dots: HH.MM.SS → HH:MM:SS
+    text = re.sub(r'(\d{2})\.(\d{2})\.(\d{2})(?=\s|$)', r'\1:\2:\3', text)
     return text
 
 # ─────────────────────────────────────────────────────────────────
@@ -1179,6 +1219,15 @@ def post_process_data(data, receipt_type):
     for time_field in ["TG vào", "TG ra", "Thời gian vào", "Thời gian ra"]:
         if time_field in data:
             data[time_field] = normalize_datetime(data[time_field])
+
+    # Giá tiền: strip currency symbols and thousand-separator noise left by OCR
+    if "Giá tiền" in data:
+        price = data["Giá tiền"]
+        price = re.sub(r'[đĐ₫]|VND|vnd|vnđ|VNĐ', '', price, flags=re.IGNORECASE).strip()
+        # Remove leading/trailing whitespace and stray punctuation
+        price = price.strip(" \t.,")
+        if price:
+            data["Giá tiền"] = price
 
     return data
 
@@ -1485,8 +1534,10 @@ class ShortcutsDialog(ctk.CTkToplevel):
     _SHORTCUTS = [
         ("Ctrl + O",       "Load directory"),
         ("Ctrl + S",       "Scan current image"),
+        ("Ctrl + B",       "Batch scan all images"),
         ("Ctrl + E",       "Export to CSV"),
         ("Ctrl + H",       "Open scan history"),
+        ("Ctrl + V",       "Paste image from clipboard"),
         ("Ctrl + ?",       "Show this shortcuts dialog"),
         ("← / →",          "Previous / Next image"),
         ("↑ / ↓",          "Previous / Next image (alternative)"),
@@ -1504,7 +1555,7 @@ class ShortcutsDialog(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("⌨️  Keyboard Shortcuts")
-        self.geometry("440x480")
+        self.geometry("440x530")
         self.resizable(False, False)
 
         ctk.CTkLabel(self, text="Keyboard Shortcuts",
@@ -1886,13 +1937,16 @@ class NextLevelOCRScanner(ctk.CTk):
         sd_tab = self.tabview.tab("Structured Data")
         sd_tab.grid_rowconfigure(0, weight=1)
         sd_tab.grid_columnconfigure(0, weight=1)
-        self.smart_data_box = ctk.CTkTextbox(
-            sd_tab, fg_color="#0F111A", text_color="#00FFAA",
-            font=ctk.CTkFont(family="Courier New", size=12), corner_radius=8)
-        self.smart_data_box.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        self.smart_data_box.insert("0.0",
+
+        # Scrollable container — field rows are built dynamically after each scan
+        self._smart_scroll = ctk.CTkScrollableFrame(
+            sd_tab, fg_color="#0F111A", corner_radius=8)
+        self._smart_scroll.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self._smart_scroll.grid_columnconfigure(0, weight=1)
+
+        # Show placeholder text until first scan
+        self._set_smart_status(
             "--- No Data ---\nHit SCAN to extract structured receipt data.")
-        self.smart_data_box.configure(state="disabled")
 
         # ── Raw OCR Text tab ───────────────────────────────────
         raw_tab = self.tabview.tab("Raw OCR Text")
@@ -2167,7 +2221,7 @@ class NextLevelOCRScanner(ctk.CTk):
             # Load thumbnail in background
             def _load_thumb(p=path, lbl=thumb_label):
                 try:
-                    img = Image.open(p)
+                    img = _open_image_cached(p)
                     img.thumbnail((_THUMB_W, _THUMB_H))
                     tk_img = ImageTk.PhotoImage(img)
                     self._thumb_refs[p] = tk_img
@@ -2196,15 +2250,14 @@ class NextLevelOCRScanner(ctk.CTk):
         self._ocr_boxes_easy = []
         self._ocr_boxes_tess = []
         try:
-            self._base_pil_img = Image.open(path)
+            self._base_pil_img = _open_image_cached(path)
             self._zoom_factor  = 1.0
             self._render_image()
             idx = self.image_files.index(path) + 1 if path in self.image_files else "?"
             total = len(self.image_files)
             self._img_name_label.configure(
                 text=f"[{idx}/{total}]  {os.path.basename(path)}")
-            self.update_textbox(self.smart_data_box,
-                                "--- Ready ---\nPress START SCAN or Ctrl+S.")
+            self._set_smart_status("--- Ready ---\nPress START SCAN or Ctrl+S.")
             self.update_textbox(self.raw_data_box, "Image loaded. Ready for OCR.")
             self.set_status(f"Preview: {os.path.basename(path)}")
             self._update_nav_buttons()
@@ -2244,7 +2297,16 @@ class NextLevelOCRScanner(ctk.CTk):
             display_w = max(1, int(orig_w * ratio))
             display_h = max(1, int(orig_h * ratio))
 
-        img = img.resize((display_w, display_h), Image.Resampling.LANCZOS)
+        # Choose resampling filter based on zoom — LANCZOS for shrink/minor zoom,
+        # BILINEAR for medium zoom (faster, acceptable quality), NEAREST for very
+        # high zoom where individual pixels are already > 1 screen pixel anyway.
+        if self._zoom_factor >= 4.0:
+            _resample = Image.Resampling.NEAREST
+        elif self._zoom_factor >= 1.5:
+            _resample = Image.Resampling.BILINEAR
+        else:
+            _resample = Image.Resampling.LANCZOS
+        img = img.resize((display_w, display_h), _resample)
 
         # Center image inside canvas
         offset_x = max(0, (cw - display_w) // 2)
@@ -2341,6 +2403,7 @@ class NextLevelOCRScanner(ctk.CTk):
         new_idx = idx + direction
         if 0 <= new_idx < len(self.image_files):
             self.display_image(self.image_files[new_idx])
+            self._scroll_sidebar_to_active()
 
     def _update_nav_buttons(self):
         """Enable/disable Prev/Next buttons based on current position."""
@@ -2756,11 +2819,11 @@ class NextLevelOCRScanner(ctk.CTk):
             return
         self.btn_scan.configure(state="disabled", text="⏳ SCANNING…")
         self.progress_bar.start()
-        self.update_textbox(self.smart_data_box,
-                            "🔬 Running Dual-Engine OCR…\n\n"
-                            "• Tesseract LSTM\n"
-                            "• EasyOCR CRNN\n\n"
-                            "First run: EasyOCR may take ~1 min to load model…")
+        self._set_smart_status(
+            "🔬 Running Dual-Engine OCR…\n\n"
+            "• Tesseract LSTM\n"
+            "• EasyOCR CRNN\n\n"
+            "First run: EasyOCR may take ~1 min to load model…")
         self.update_textbox(self.raw_data_box, "⚙️  Processing…")
         self.set_status(f"Scanning: {os.path.basename(self.current_image_path)}")
         t = threading.Thread(target=self._run_single_scan,
@@ -2771,7 +2834,7 @@ class NextLevelOCRScanner(ctk.CTk):
         t0 = time.time()
         try:
             auto_deskew = _config.get("auto_deskew", False)
-            original_img = Image.open(image_path)
+            original_img = _open_image_cached(image_path)
             img_tess     = preprocess_image(original_img, auto_deskew=auto_deskew)
             img_easy     = preprocess_for_easyocr(original_img, auto_deskew=auto_deskew)
 
@@ -2804,12 +2867,12 @@ class NextLevelOCRScanner(ctk.CTk):
                     ocr_confidence=easy_conf,
                 )
 
-            smart_out, raw_out = self._format_output(
+            info_text, raw_out = self._format_output(
                 engine_label, receipt_type, metadata, extracted_text,
                 easy_text, elapsed_ms, easy_conf)
 
             self.after(0, self._finish_single_scan,
-                       smart_out, raw_out, metadata, receipt_type,
+                       info_text, raw_out, metadata, receipt_type,
                        elapsed_ms, engine_label, easy_boxes, tess_boxes)
 
         except pytesseract.TesseractError as exc:
@@ -2835,28 +2898,24 @@ class NextLevelOCRScanner(ctk.CTk):
             filled = int(easy_conf * 20)
             conf_bar = f"\n🎯 Conf: [{'█' * filled}{'░' * (20 - filled)}] {easy_conf * 100:.1f}%"
 
-        smart = (f"🔬 Engine:  {engine_label}\n"
-                 f"📋 Type:    {type_label}\n"
-                 f"⏱  Time:    {elapsed_ms} ms"
-                 + conf_bar + "\n"
-                 + "─" * 44 + "\n\n")
-        if metadata:
-            for k, v in metadata.items():
-                smart += f"► {k}:\n   [ {v} ]\n\n"
-        else:
-            smart += "⚠️  No receipt data found.\nCheck Raw OCR Text tab for raw output."
+        info_text = (
+            f"🔬 Engine:  {engine_label}\n"
+            f"📋 Type:    {type_label}\n"
+            f"⏱  Time:    {elapsed_ms} ms"
+            + conf_bar
+        )
 
         raw = "=== MERGED OCR TEXT ===\n"
         raw += extracted_text.strip() or "[No text found]"
         if easy_text.strip():
             raw += "\n\n=== EASYOCR RAW ===\n" + easy_text.strip()
 
-        return smart.strip(), raw
+        return info_text, raw
 
-    def _finish_single_scan(self, smart_text, raw_text, metadata,
+    def _finish_single_scan(self, info_text, raw_text, metadata,
                              receipt_type, elapsed_ms, engine_label,
                              easy_boxes=None, tess_boxes=None):
-        self.update_textbox(self.smart_data_box, smart_text)
+        self._render_fields(info_text, metadata or {})
         self.update_textbox(self.raw_data_box,   raw_text)
         self.latest_metadata     = metadata or {}
         self.latest_receipt_type = receipt_type
