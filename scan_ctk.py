@@ -1417,8 +1417,10 @@ class HistoryDialog(ctk.CTkToplevel):
         """Fill the treeview with *rows*, applying the current sort."""
         col = self._sort_col
         try:
-            sorted_rows = sorted(rows, key=lambda r: (r.get(col) or ""),
-                                 reverse=not self._sort_asc)
+            sorted_rows = sorted(
+                rows,
+                key=lambda r: (r.get(col) if r.get(col) is not None else ""),
+                reverse=not self._sort_asc)
         except Exception:
             sorted_rows = rows
         self._tree.delete(*self._tree.get_children())
@@ -1580,8 +1582,11 @@ class StatisticsDialog(ctk.CTkToplevel):
         lines.append("  Last 7 days:")
         week = today.get("week_by_day", {})
         if week:
+            max_cnt = max(week.values()) if week else 1
+            bar_scale = 28 / max(max_cnt, 1)   # proportional to max, width 28
             for day, cnt in sorted(week.items()):
-                bar = "█" * min(cnt, 30)
+                bar_len = max(1, int(cnt * bar_scale)) if cnt else 0
+                bar = "█" * bar_len
                 lines.append(f"    {day}  {bar} {cnt}")
         else:
             lines.append("    (no data)")
@@ -1612,6 +1617,7 @@ class NextLevelOCRScanner(ctk.CTk):
         self.image_files: list       = []
         self.file_buttons: dict      = {}
         self._thumb_refs: dict       = {}   # path → PhotoImage thumbnail
+        self._row_frames: dict       = {}   # path → container widget (frame or button)
         self.current_image_path: str = ""
         self.latest_metadata: dict   = {}
         self.latest_receipt_type     = "unknown"
@@ -2080,6 +2086,7 @@ class NextLevelOCRScanner(ctk.CTk):
         self.image_files  = []
         self.file_buttons = {}
         self._thumb_refs  = {}
+        self._row_frames  = {}
         for f in sorted(os.listdir(dir_path)):
             if f.lower().endswith(_SUPPORTED_EXTENSIONS):
                 self.image_files.append(os.path.join(dir_path, f))
@@ -2107,6 +2114,7 @@ class NextLevelOCRScanner(ctk.CTk):
         self.image_files  = [path]
         self.file_buttons = {}
         self._thumb_refs  = {}
+        self._row_frames  = {}
         self._add_file_button(path)
         self._file_count_label.configure(text="(1)")
         self.display_image(path)
@@ -2138,6 +2146,8 @@ class NextLevelOCRScanner(ctk.CTk):
             row_frame.grid_columnconfigure(1, weight=1)
 
             # Thumbnail placeholder — loaded lazily in background
+            # Note: actual thumbnail may be smaller than _THUMB_W × _THUMB_H
+            # because Image.thumbnail() preserves aspect ratio.
             thumb_label = ctk.CTkLabel(row_frame, text="", width=_THUMB_W, height=_THUMB_H,
                                         fg_color="#1E293B", corner_radius=2)
             thumb_label.grid(row=0, column=0, padx=(2, 4), pady=2)
@@ -2150,6 +2160,9 @@ class NextLevelOCRScanner(ctk.CTk):
                 command=lambda p=path: self.display_image(p)
             )
             btn.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+
+            # Store container frame so _remove_current_from_list can destroy it directly
+            self._row_frames[path] = row_frame
 
             # Load thumbnail in background
             def _load_thumb(p=path, lbl=thumb_label):
@@ -2170,6 +2183,7 @@ class NextLevelOCRScanner(ctk.CTk):
                 command=lambda p=path: self.display_image(p)
             )
             btn.pack(fill='x', pady=1)
+            self._row_frames[path] = btn  # plain button is its own container
         self.file_buttons[path] = btn
 
     def display_image(self, path: str):
@@ -2348,6 +2362,7 @@ class NextLevelOCRScanner(ctk.CTk):
         self.image_files  = []
         self.file_buttons = {}
         self._thumb_refs  = {}
+        self._row_frames.clear()
         self.current_image_path = ""
         self._file_count_label.configure(text="")
         self._preview_canvas.delete("all")
@@ -2369,15 +2384,14 @@ class NextLevelOCRScanner(ctk.CTk):
             return
         # Determine next image to display
         self.image_files.remove(path)
-        btn = self.file_buttons.pop(path, None)
-        if btn:
+        self.file_buttons.pop(path, None)
+        # Use stored container reference for reliable destruction
+        container = self._row_frames.pop(path, None)
+        if container:
             try:
-                btn.master.destroy()  # destroy thumbnail row frame (if using thumbnails)
+                container.destroy()
             except Exception:
-                try:
-                    btn.destroy()
-                except Exception:
-                    pass
+                pass
         self._thumb_refs.pop(path, None)
         self._file_count_label.configure(text=f"({len(self.image_files)})")
         if self.image_files:
