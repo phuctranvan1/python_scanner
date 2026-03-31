@@ -8,6 +8,8 @@ import shutil
 import logging
 import logging.handlers
 import time
+import math
+import functools
 import tkinter as tk
 import tkinter.messagebox as messagebox
 import tkinter.ttk as ttk
@@ -16,7 +18,7 @@ import csv
 import json
 import difflib
 import sqlite3
-from datetime import datetime
+from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageEnhance, ImageFilter, ImageOps  # type: ignore
@@ -39,19 +41,47 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
 
 # Supported image file extensions
 _SUPPORTED_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp')
 
 # Image preview zoom constraints
-_MIN_ZOOM = 0.2
-_MAX_ZOOM = 5.0
+_MIN_ZOOM = 0.1
+_MAX_ZOOM = 8.0
 
 # Fallback preview panel dimensions (pixels) used when the widget has not yet been rendered
 _DEFAULT_PREVIEW_W = 780
 _DEFAULT_PREVIEW_H = 860
+
+# Sidebar thumbnail dimensions
+_THUMB_W = 68
+_THUMB_H = 46
+
+# Maximum recent files remembered
+_RECENT_FILES_MAX = 10
+
+# Per-field color theming for the structured data panel
+_FIELD_COLORS: dict = {
+    "Mã giao dịch":  "#FFD700",   # gold
+    "Biển số":       "#60A5FA",   # sky blue
+    "EPC":           "#A78BFA",   # violet
+    "Giá tiền":      "#34D399",   # emerald
+    "Trạng thái":    "#F87171",   # red
+    "TG vào":        "#FB923C",   # orange
+    "TG ra":         "#FB923C",
+    "Thời gian vào": "#FB923C",
+    "Thời gian ra":  "#FB923C",
+    "Trạm vào":      "#38BDF8",   # light blue
+    "Trạm ra":       "#38BDF8",
+    "Id trạm vào":   "#94A3B8",   # slate
+    "Id trạm ra":    "#94A3B8",
+    "Làn vào":       "#C084FC",   # purple
+    "Làn ra":        "#C084FC",
+    "Loại vé":       "#4ADE80",   # green
+    "Đơn vị":        "#F9A8D4",   # pink
+}
 
 # ─────────────────────────────────────────────────────────────────
 # Configuration Management
@@ -71,6 +101,11 @@ _DEFAULT_CONFIG: dict = {
     "max_log_size_mb":    10,
     "log_backup_count":   5,
     "export_directory":   str(Path.home()),
+    "recent_files":       [],
+    "show_thumbnails":    True,
+    "auto_deskew":        False,
+    "zoom_step":          1.2,
+    "window_geometry":    "",
 }
 
 
@@ -350,6 +385,47 @@ class DatabaseManager:
             finally:
                 conn.close()
 
+    def get_today_stats(self) -> dict:
+        """Return scan counts for today and this week."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                today_str = date.today().strftime('%Y-%m-%d')
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM scans WHERE scan_time LIKE ?",
+                    (f"{today_str}%",))
+                today_count = cur.fetchone()["cnt"]
+                # Last 7 days
+                cur.execute('''
+                    SELECT DATE(scan_time) AS day, COUNT(*) AS cnt
+                    FROM scans
+                    WHERE scan_time >= DATE('now', '-6 days')
+                    GROUP BY day ORDER BY day
+                ''')
+                week_by_day = {r["day"]: r["cnt"] for r in cur.fetchall()}
+                return {"today": today_count, "week_by_day": week_by_day}
+            except Exception as exc:
+                logger.error("DB today stats error: %s", exc)
+                return {"today": 0, "week_by_day": {}}
+            finally:
+                conn.close()
+
+    def delete_scan(self, scan_id: int) -> bool:
+        """Delete a single scan record by id. Returns True on success."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
+                conn.commit()
+                logger.info("Deleted scan id=%d", scan_id)
+                return True
+            except Exception as exc:
+                logger.error("DB delete error: %s", exc)
+                return False
+            finally:
+                conn.close()
+
     def export_all_csv(self, file_path: str) -> int:
         """Dump all rows to CSV. Returns number of rows written."""
         with self._lock:
@@ -405,17 +481,82 @@ ctk.set_appearance_mode(_config.get("theme", "Dark"))
 ctk.set_default_color_theme(_config.get("color_theme", "blue"))
 
 # ─────────────────────────────────────────────────────────────────
+# Image Deskewing
+# ─────────────────────────────────────────────────────────────────
+
+def detect_skew_angle(gray_img: np.ndarray) -> float:
+    """Detect the dominant text skew angle (degrees) in a grayscale image.
+
+    Uses Probabilistic Hough Line Transform on a Canny-edge map.  Returns 0.0
+    if no reliable angle is found or if the detected skew is negligible
+    (< 0.5°).  The returned angle is clamped to ±45° to avoid catastrophic
+    misdetections.
+    """
+    edges = cv2.Canny(gray_img, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(
+        edges, rho=1, theta=np.pi / 180, threshold=100,
+        minLineLength=gray_img.shape[1] // 5,
+        maxLineGap=20,
+    )
+    if lines is None:
+        return 0.0
+
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 == x1:
+            continue
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        # Keep only near-horizontal lines (text baselines)
+        if abs(angle) < 45:
+            angles.append(angle)
+
+    if not angles:
+        return 0.0
+
+    # Use median for robustness against outliers
+    median_angle = float(np.median(angles))
+    if abs(median_angle) < 0.5:
+        return 0.0
+    return max(-45.0, min(45.0, median_angle))
+
+
+def deskew_image(pil_img: Image.Image) -> Image.Image:
+    """Rotate *pil_img* to correct any detected text skew.
+
+    Returns the corrected PIL image (RGB), or the original unchanged if the
+    skew is negligible or detection fails.
+    """
+    try:
+        gray = np.array(pil_img.convert("L"))
+        angle = detect_skew_angle(gray)
+        if angle == 0.0:
+            return pil_img
+        rotated = pil_img.rotate(-angle, expand=True, fillcolor=(255, 255, 255),
+                                 resample=Image.Resampling.BICUBIC)
+        logger.debug("Deskew: corrected %.2f°", angle)
+        return rotated
+    except Exception as exc:
+        logger.warning("Deskew failed: %s", exc)
+        return pil_img
+
+# ─────────────────────────────────────────────────────────────────
 # Image Preprocessing
 # ─────────────────────────────────────────────────────────────────
 
-def preprocess_image(img):
+def preprocess_image(img, auto_deskew: bool = False):
     """
     Preprocessing pipeline tối ưu cho hai loại screenshot điện thoại:
     - Loại 1: Nền trắng, chữ đen, layout dọc (giao diện web)
     - Loại 2: Nền trắng/xanh lá, text đen, layout key:value (VETC app)
     Các screenshot này thường rõ ràng hơn ảnh scan thật → cần xử lý nhẹ nhàng,
     tránh làm mờ hoặc méo chữ.
+
+    If *auto_deskew* is True the image is skew-corrected before binarisation.
     """
+    if auto_deskew:
+        img = deskew_image(img)
+
     open_cv_image = np.array(img)
 
     # Convert to grayscale
@@ -468,9 +609,15 @@ def preprocess_image(img):
     return Image.fromarray(binary)
 
 
-def preprocess_for_easyocr(img):
+def preprocess_for_easyocr(img, auto_deskew: bool = False):
     """Preprocessing riêng cho EasyOCR: giữ ảnh màu (RGB) và tăng tương phản.
-    EasyOCR được huấn luyện trên ảnh màu nên cho kết quả tốt hơn grayscale."""
+    EasyOCR được huấn luyện trên ảnh màu nên cho kết quả tốt hơn grayscale.
+
+    If *auto_deskew* is True the image is skew-corrected first.
+    """
+    if auto_deskew:
+        img = deskew_image(img)
+
     open_cv_image = np.array(img)
 
     # Keep colour — convert to BGR for OpenCV processing
@@ -1089,7 +1236,7 @@ class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent, cfg: dict, on_save):
         super().__init__(parent)
         self.title("⚙️ Settings")
-        self.geometry("560x480")
+        self.geometry("580x560")
         self.resizable(False, False)
         self.grab_set()           # modal
         self._cfg    = cfg
@@ -1130,14 +1277,22 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkOptionMenu(self, variable=self._log_var,
                           values=["DEBUG", "INFO", "WARNING", "ERROR"]).pack(fill='x', padx=20, pady=0)
 
-        # Auto-scan toggle
+        # Toggles
         self._auto_var = ctk.BooleanVar(value=cfg.get("auto_scan_on_load", False))
         ctk.CTkCheckBox(self, text="Auto-scan first image when loading directory",
-                        variable=self._auto_var).pack(anchor='w', padx=20, pady=12)
+                        variable=self._auto_var).pack(anchor='w', padx=20, pady=(12, 4))
+
+        self._deskew_var = ctk.BooleanVar(value=cfg.get("auto_deskew", False))
+        ctk.CTkCheckBox(self, text="Auto-deskew images before OCR (corrects text angle)",
+                        variable=self._deskew_var).pack(anchor='w', padx=20, pady=4)
+
+        self._thumb_var = ctk.BooleanVar(value=cfg.get("show_thumbnails", True))
+        ctk.CTkCheckBox(self, text="Show image thumbnails in file list",
+                        variable=self._thumb_var).pack(anchor='w', padx=20, pady=4)
 
         # Buttons
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill='x', padx=20, pady=(10, 20))
+        btn_frame.pack(fill='x', padx=20, pady=(14, 20))
         ctk.CTkButton(btn_frame, text="💾 Save", fg_color="#10B981", hover_color="#059669",
                       command=self._save).pack(side='left', expand=True, fill='x', padx=(0, 5))
         ctk.CTkButton(btn_frame, text="✖ Cancel", fg_color="#6B7280", hover_color="#4B5563",
@@ -1166,6 +1321,8 @@ class SettingsDialog(ctk.CTkToplevel):
         self._cfg["theme"]             = self._theme_var.get()
         self._cfg["log_level"]         = self._log_var.get()
         self._cfg["auto_scan_on_load"] = self._auto_var.get()
+        self._cfg["auto_deskew"]       = self._deskew_var.get()
+        self._cfg["show_thumbnails"]   = self._thumb_var.get()
         save_config(self._cfg)
         if self._on_save:
             self._on_save(self._cfg)
@@ -1189,7 +1346,7 @@ class HistoryDialog(ctk.CTkToplevel):
     def __init__(self, parent, db: DatabaseManager):
         super().__init__(parent)
         self.title("📋 Scan History")
-        self.geometry("1100x560")
+        self.geometry("1150x580")
         self._db = db
 
         top = ctk.CTkFrame(self, fg_color="transparent")
@@ -1198,12 +1355,21 @@ class HistoryDialog(ctk.CTkToplevel):
         self._search_var = ctk.StringVar()
         search_entry = ctk.CTkEntry(top, textvariable=self._search_var, width=250)
         search_entry.pack(side='left', padx=8)
+        search_entry.bind("<Return>", lambda _e: self._refresh())
         ctk.CTkButton(top, text="🔍 Search", width=90,
                       command=self._refresh).pack(side='left')
         ctk.CTkButton(top, text="↺ Reset", width=80,
                       command=self._reset).pack(side='left', padx=6)
+        ctk.CTkButton(top, text="🗑 Delete", width=80,
+                      fg_color="#991B1B", hover_color="#7F1D1D",
+                      command=self._delete_selected).pack(side='left', padx=6)
         ctk.CTkButton(top, text="📊 Export All CSV", fg_color="#B91C1C",
                       hover_color="#991B1B", command=self._export_all_csv).pack(side='right')
+
+        # Row count label
+        self._count_label = ctk.CTkLabel(top, text="", font=ctk.CTkFont(size=11),
+                                          text_color="gray60")
+        self._count_label.pack(side='right', padx=10)
 
         # Treeview inside a frame
         tree_frame = ctk.CTkFrame(self)
@@ -1222,7 +1388,8 @@ class HistoryDialog(ctk.CTkToplevel):
                                    show="headings", selectmode="browse")
         col_widths = (40, 140, 100, 110, 100, 80, 80, 140, 60, 75)
         for col, hdr, w in zip(self._COLUMNS, self._HEADERS, col_widths):
-            self._tree.heading(col, text=hdr)
+            self._tree.heading(col, text=hdr,
+                               command=lambda c=col: self._sort_by(c))
             self._tree.column(col, width=w, anchor="w")
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical",   command=self._tree.yview)
@@ -1232,15 +1399,32 @@ class HistoryDialog(ctk.CTkToplevel):
         hsb.pack(side='bottom', fill='x')
         self._tree.pack(fill='both', expand=True)
 
+        self._sort_col   = "id"
+        self._sort_asc   = False
+        self._cached_rows: list = []
         self._refresh()
 
-    def _refresh(self):
-        search = self._search_var.get().strip()
-        rows = self._db.get_recent_scans(limit=200, search=search)
+    def _sort_by(self, col: str):
+        """Toggle sort order and re-display the cached rows."""
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+        self._populate(self._cached_rows)
+
+    def _populate(self, rows: list):
+        """Fill the treeview with *rows*, applying the current sort."""
+        col = self._sort_col
+        try:
+            sorted_rows = sorted(rows, key=lambda r: (r.get(col) or ""),
+                                 reverse=not self._sort_asc)
+        except Exception:
+            sorted_rows = rows
         self._tree.delete(*self._tree.get_children())
-        for r in rows:
+        for r in sorted_rows:
             conf_pct = f"{r.get('ocr_confidence', 0) * 100:.1f}" if r.get('ocr_confidence') else ""
-            self._tree.insert("", "end", values=(
+            self._tree.insert("", "end", iid=str(r.get("id", "")), values=(
                 r.get("id", ""),
                 r.get("scan_time", ""),
                 r.get("receipt_type", ""),
@@ -1252,10 +1436,29 @@ class HistoryDialog(ctk.CTkToplevel):
                 conf_pct,
                 r.get("processing_time_ms", ""),
             ))
+        self._count_label.configure(text=f"{len(sorted_rows)} records")
+
+
+    def _refresh(self):
+        search = self._search_var.get().strip()
+        self._cached_rows = self._db.get_recent_scans(limit=200, search=search)
+        self._populate(self._cached_rows)
 
     def _reset(self):
         self._search_var.set("")
         self._refresh()
+
+    def _delete_selected(self):
+        """Delete the selected scan record from the database."""
+        sel = self._tree.selection()
+        if not sel:
+            return
+        scan_id = int(sel[0])
+        if messagebox.askyesno("Delete Record",
+                               f"Delete scan record ID {scan_id}?",
+                               parent=self):
+            if self._db.delete_scan(scan_id):
+                self._refresh()
 
     def _export_all_csv(self):
         ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1271,6 +1474,126 @@ class HistoryDialog(ctk.CTkToplevel):
 
 
 # ─────────────────────────────────────────────────────────────────
+# Shortcuts Help Dialog
+# ─────────────────────────────────────────────────────────────────
+
+class ShortcutsDialog(ctk.CTkToplevel):
+    """Non-modal dialog listing all keyboard shortcuts."""
+
+    _SHORTCUTS = [
+        ("Ctrl + O",       "Load directory"),
+        ("Ctrl + S",       "Scan current image"),
+        ("Ctrl + E",       "Export to CSV"),
+        ("Ctrl + H",       "Open scan history"),
+        ("Ctrl + ?",       "Show this shortcuts dialog"),
+        ("← / →",          "Previous / Next image"),
+        ("↑ / ↓",          "Previous / Next image (alternative)"),
+        ("R",              "Rotate image 90° clockwise"),
+        ("Shift + R",      "Rotate image 90° counter-clockwise"),
+        ("F",              "Fit image to window"),
+        ("D",              "Auto-deskew current image"),
+        ("B",              "Toggle OCR bounding boxes"),
+        ("+ / =",          "Zoom in"),
+        ("- / _",          "Zoom out"),
+        ("0",              "Reset zoom to 100%"),
+        ("Delete",         "Remove current image from list"),
+    ]
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("⌨️  Keyboard Shortcuts")
+        self.geometry("440x480")
+        self.resizable(False, False)
+
+        ctk.CTkLabel(self, text="Keyboard Shortcuts",
+                     font=ctk.CTkFont(size=17, weight="bold")).pack(pady=(18, 10))
+
+        frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        frame.pack(fill='both', expand=True, padx=16, pady=(0, 10))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_columnconfigure(1, weight=2)
+
+        for row_idx, (key, desc) in enumerate(self._SHORTCUTS):
+            bg = "#1E293B" if row_idx % 2 == 0 else "transparent"
+            row_frame = ctk.CTkFrame(frame, fg_color=bg, corner_radius=4)
+            row_frame.grid(row=row_idx, column=0, columnspan=2,
+                           sticky="ew", pady=1, padx=2)
+            row_frame.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(row_frame, text=key, width=120,
+                         font=ctk.CTkFont(family="Courier New", size=12, weight="bold"),
+                         text_color="#60A5FA", anchor="w"
+                         ).grid(row=0, column=0, padx=(8, 4), pady=4, sticky="w")
+            ctk.CTkLabel(row_frame, text=desc,
+                         font=ctk.CTkFont(size=12),
+                         text_color="#CBD5E1", anchor="w"
+                         ).grid(row=0, column=1, padx=(4, 8), pady=4, sticky="w")
+
+        ctk.CTkButton(self, text="Close", width=120,
+                      command=self.destroy).pack(pady=(4, 16))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Statistics Dialog
+# ─────────────────────────────────────────────────────────────────
+
+class StatisticsDialog(ctk.CTkToplevel):
+    """Display aggregate scan statistics in a simple read-only window."""
+
+    def __init__(self, parent, db: DatabaseManager):
+        super().__init__(parent)
+        self.title("📊 Scan Statistics")
+        self.geometry("420x440")
+        self.resizable(False, False)
+        self._db = db
+
+        ctk.CTkLabel(self, text="Scan Statistics",
+                     font=ctk.CTkFont(size=17, weight="bold")).pack(pady=(18, 6))
+
+        self._text = ctk.CTkTextbox(
+            self, fg_color="#0F111A", text_color="#00FFAA",
+            font=ctk.CTkFont(family="Courier New", size=12), corner_radius=8)
+        self._text.pack(fill='both', expand=True, padx=16, pady=(6, 0))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill='x', padx=16, pady=12)
+        ctk.CTkButton(btn_frame, text="↺ Refresh", width=100,
+                      command=self._load).pack(side='left', padx=(0, 6))
+        ctk.CTkButton(btn_frame, text="Close", width=100,
+                      command=self.destroy).pack(side='left')
+
+        self._load()
+
+    def _load(self):
+        stats = self._db.get_statistics()
+        today = self._db.get_today_stats()
+        lines = []
+        lines.append(f"{'─' * 34}")
+        lines.append(f"  Total scans:      {stats.get('total', 0)}")
+        lines.append(f"  Today:            {today.get('today', 0)}")
+        avg = stats.get("avg_processing_ms", 0)
+        lines.append(f"  Avg process time: {avg:.0f} ms")
+        lines.append(f"{'─' * 34}")
+        lines.append("  By receipt type:")
+        for rtype, cnt in (stats.get("by_type") or {}).items():
+            lines.append(f"    {rtype:<22} {cnt}")
+        lines.append(f"{'─' * 34}")
+        lines.append("  Last 7 days:")
+        week = today.get("week_by_day", {})
+        if week:
+            for day, cnt in sorted(week.items()):
+                bar = "█" * min(cnt, 30)
+                lines.append(f"    {day}  {bar} {cnt}")
+        else:
+            lines.append("    (no data)")
+        lines.append(f"{'─' * 34}")
+
+        self._text.configure(state="normal")
+        self._text.delete("0.0", "end")
+        self._text.insert("0.0", "\n".join(lines))
+        self._text.configure(state="disabled")
+
+
+# ─────────────────────────────────────────────────────────────────
 # Enterprise GUI
 # ─────────────────────────────────────────────────────────────────
 
@@ -1281,18 +1604,21 @@ class NextLevelOCRScanner(ctk.CTk):
         super().__init__()
 
         self.title(APP_TITLE)
-        self.geometry("1400x860")
+        self.geometry(_config.get("window_geometry", "") or "1440x900")
         self.minsize(1100, 700)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # ── State ──────────────────────────────────────────────
         self.image_files: list       = []
         self.file_buttons: dict      = {}
+        self._thumb_refs: dict       = {}   # path → PhotoImage thumbnail
         self.current_image_path: str = ""
         self.latest_metadata: dict   = {}
         self.latest_receipt_type     = "unknown"
         self._scan_lock              = threading.Lock()
         self._batch_running          = False
         self._batch_cancel           = threading.Event()
+        self._rotation_angle: int    = 0    # cumulative rotation (0/90/180/270)
 
         # ── Bounding-box / OCR overlay state ───────────────────
         self._ocr_boxes_easy: list       = []   # [(bbox_quad, text, conf), ...]
@@ -1326,6 +1652,16 @@ class NextLevelOCRScanner(ctk.CTk):
         self.set_status(f"Ready — {APP_NAME} {APP_VERSION} | DB: {_config['db_path']}")
         logger.info("GUI initialised.")
 
+    def _on_close(self):
+        """Persist window geometry before quit."""
+        try:
+            _config["window_geometry"] = self.geometry()
+            save_config(_config)
+        except Exception:
+            pass
+        self.destroy()
+
+
     # ──────────────────────────────────────────────────────────
     # Build helpers
     # ──────────────────────────────────────────────────────────
@@ -1355,6 +1691,21 @@ class NextLevelOCRScanner(ctk.CTk):
         ctk.CTkFrame(self.sidebar_frame, height=1, fg_color="#334155").pack(
             fill='x', padx=16, pady=10)
 
+        # Navigation row: Previous / Next
+        nav_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        nav_frame.pack(fill='x', padx=16, pady=2)
+        nav_frame.grid_columnconfigure((0, 1), weight=1)
+        self._btn_prev = ctk.CTkButton(
+            nav_frame, text="◀ Prev", width=0,
+            fg_color="#334155", hover_color="#1E293B",
+            command=lambda: self._navigate(-1))
+        self._btn_prev.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self._btn_next = ctk.CTkButton(
+            nav_frame, text="Next ▶", width=0,
+            fg_color="#334155", hover_color="#1E293B",
+            command=lambda: self._navigate(1))
+        self._btn_next.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+
         ctk.CTkButton(
             self.sidebar_frame, text="📋 History",
             fg_color="#475569", hover_color="#334155",
@@ -1362,14 +1713,38 @@ class NextLevelOCRScanner(ctk.CTk):
         ).pack(fill='x', padx=16, pady=5)
 
         ctk.CTkButton(
+            self.sidebar_frame, text="📊 Statistics",
+            fg_color="#475569", hover_color="#334155",
+            command=self._open_statistics
+        ).pack(fill='x', padx=16, pady=2)
+
+        ctk.CTkButton(
             self.sidebar_frame, text="⚙️  Settings",
             fg_color="#374151", hover_color="#1F2937",
             command=self._open_settings
         ).pack(fill='x', padx=16, pady=5)
 
-        ctk.CTkLabel(self.sidebar_frame,
-                     text="Images:", font=ctk.CTkFont(size=12)).pack(
-            pady=(14, 4), padx=16, anchor='w')
+        ctk.CTkButton(
+            self.sidebar_frame, text="⌨️  Shortcuts",
+            fg_color="#1E293B", hover_color="#0F172A",
+            command=self._open_shortcuts
+        ).pack(fill='x', padx=16, pady=2)
+
+        # File list header with count badge and Clear button
+        list_header = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        list_header.pack(fill='x', padx=16, pady=(12, 2))
+        ctk.CTkLabel(list_header, text="Images:",
+                     font=ctk.CTkFont(size=12)).pack(side='left')
+        self._file_count_label = ctk.CTkLabel(
+            list_header, text="", font=ctk.CTkFont(size=10),
+            text_color="#60A5FA")
+        self._file_count_label.pack(side='left', padx=4)
+        ctk.CTkButton(
+            list_header, text="✕ Clear", width=60,
+            fg_color="transparent", hover_color="#374151",
+            font=ctk.CTkFont(size=10), text_color="#9CA3AF",
+            command=self._clear_file_list
+        ).pack(side='right')
 
         self.scrollable_file_list = ctk.CTkScrollableFrame(
             self.sidebar_frame, fg_color="transparent")
@@ -1385,10 +1760,10 @@ class NextLevelOCRScanner(ctk.CTk):
     def _build_preview(self):
         self.preview_frame = ctk.CTkFrame(self, corner_radius=10)
         self.preview_frame.grid(row=0, column=1, sticky="nsew", padx=0, pady=10)
-        self.preview_frame.grid_rowconfigure(1, weight=1)
         self.preview_frame.grid_columnconfigure(0, weight=1)
+        # row 0 = zoom toolbar, row 1 = manipulation toolbar, row 2 = canvas
 
-        # ── Toolbar ────────────────────────────────────────────
+        # ── Toolbar row 1 ──────────────────────────────────────
         tb = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
         tb.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 0))
 
@@ -1397,41 +1772,72 @@ class NextLevelOCRScanner(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"))
         self._img_name_label.pack(side='left')
 
-        # Zoom buttons (right side, added right-to-left so order stays readable)
+        # Right side: zoom controls
         ctk.CTkButton(tb, text="🔍+", width=36,
                       command=lambda: self._zoom(1.2)).pack(side='right', padx=2)
         ctk.CTkButton(tb, text="🔍−", width=36,
                       command=lambda: self._zoom(1 / 1.2)).pack(side='right', padx=2)
-        ctk.CTkButton(tb, text="⟳", width=36,
+        ctk.CTkButton(tb, text="⊞", width=36,
                       command=self._zoom_reset).pack(side='right', padx=2)
+        ctk.CTkButton(tb, text="↔ Fit", width=46,
+                      fg_color="#374151", hover_color="#1F2937",
+                      command=self._fit_to_window).pack(side='right', padx=2)
+
+        # Zoom level indicator
+        self._zoom_label = ctk.CTkLabel(
+            tb, text="100%", font=ctk.CTkFont(size=10), text_color="#9CA3AF", width=38)
+        self._zoom_label.pack(side='right', padx=(0, 4))
+
+        # ── Toolbar row 2 ──────────────────────────────────────
+        self.preview_frame.grid_rowconfigure(0, weight=0)  # row 0 = tb (zoom controls)
+        tb2 = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
+        tb2.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 0))
+        self.preview_frame.grid_rowconfigure(2, weight=1)  # canvas row
+
+        # Rotation buttons
+        ctk.CTkButton(tb2, text="↺ 90°", width=56,
+                      fg_color="#374151", hover_color="#1F2937",
+                      command=lambda: self._rotate_image(-90)
+                      ).pack(side='left', padx=2)
+        ctk.CTkButton(tb2, text="↻ 90°", width=56,
+                      fg_color="#374151", hover_color="#1F2937",
+                      command=lambda: self._rotate_image(90)
+                      ).pack(side='left', padx=2)
+        ctk.CTkButton(tb2, text="🔄 180°", width=62,
+                      fg_color="#374151", hover_color="#1F2937",
+                      command=lambda: self._rotate_image(180)
+                      ).pack(side='left', padx=2)
+        ctk.CTkButton(tb2, text="📐 Deskew", width=76,
+                      fg_color="#065F46", hover_color="#047857",
+                      command=self._deskew_current).pack(side='left', padx=2)
 
         # Box-source selector (EasyOCR / Tesseract / Both)
         self._box_source_var = ctk.StringVar(value="both")
         ctk.CTkOptionMenu(
-            tb, variable=self._box_source_var,
+            tb2, variable=self._box_source_var,
             values=["both", "easy", "tess"],
             width=84, command=self._on_box_source_change,
         ).pack(side='right', padx=2)
-        ctk.CTkLabel(tb, text="Source:", font=ctk.CTkFont(size=11)
+        ctk.CTkLabel(tb2, text="Source:", font=ctk.CTkFont(size=11)
                      ).pack(side='right', padx=(10, 2))
 
         # Boxes toggle
         self._boxes_btn = ctk.CTkButton(
-            tb, text="🔲 Boxes ON", width=100,
+            tb2, text="🔲 Boxes ON", width=100,
             fg_color="#1D4ED8", hover_color="#1E40AF",
             command=self._toggle_boxes)
         self._boxes_btn.pack(side='right', padx=(2, 6))
 
-        # Save annotated image button
+        # Save annotated image button (in toolbar row 1)
         self._btn_save_img = ctk.CTkButton(
-            tb, text="💾 Save Image", width=110,
+            tb2, text="💾 Save", width=70,
             fg_color="#065F46", hover_color="#047857",
             command=self.save_annotated_image)
-        self._btn_save_img.pack(side='right', padx=(2, 2))
+        self._btn_save_img.pack(side='left', padx=(6, 2))
 
-        # ── Canvas (replaces CTkLabel) ─────────────────────────
+        # ── Canvas ─────────────────────────────────────────────
         canvas_host = ctk.CTkFrame(self.preview_frame, fg_color="#111827")
-        canvas_host.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        canvas_host.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
         canvas_host.grid_rowconfigure(0, weight=1)
         canvas_host.grid_columnconfigure(0, weight=1)
 
@@ -1576,7 +1982,13 @@ class NextLevelOCRScanner(ctk.CTk):
             self._status_bar, text="",
             font=ctk.CTkFont(size=11), text_color="#6B7280", anchor="e")
         self._clock_label.pack(side='right', padx=12)
+        # Today's scan count
+        self._today_label = ctk.CTkLabel(
+            self._status_bar, text="",
+            font=ctk.CTkFont(size=11), text_color="#4ADE80", anchor="e")
+        self._today_label.pack(side='right', padx=8)
         self._tick_clock()
+        self._refresh_today_label()
 
     def _bind_shortcuts(self):
         self.bind("<Control-o>", lambda e: self.load_directory())
@@ -1587,6 +1999,33 @@ class NextLevelOCRScanner(ctk.CTk):
         self.bind("<Control-E>", lambda e: self.export_to_csv())
         self.bind("<Control-h>", lambda e: self._open_history())
         self.bind("<Control-H>", lambda e: self._open_history())
+        self.bind("<Control-question>", lambda e: self._open_shortcuts())
+
+        # Image navigation
+        self.bind("<Left>",  lambda e: self._navigate(-1))
+        self.bind("<Right>", lambda e: self._navigate(1))
+        self.bind("<Up>",    lambda e: self._navigate(-1))
+        self.bind("<Down>",  lambda e: self._navigate(1))
+
+        # Image manipulation
+        self.bind("<r>",     lambda e: self._rotate_image(90))
+        self.bind("<R>",     lambda e: self._rotate_image(-90))
+        self.bind("<f>",     lambda e: self._fit_to_window())
+        self.bind("<F>",     lambda e: self._fit_to_window())
+        self.bind("<d>",     lambda e: self._deskew_current())
+        self.bind("<D>",     lambda e: self._deskew_current())
+        self.bind("<b>",     lambda e: self._toggle_boxes())
+        self.bind("<B>",     lambda e: self._toggle_boxes())
+
+        # Zoom
+        self.bind("<plus>",      lambda e: self._zoom(1.2))
+        self.bind("<equal>",     lambda e: self._zoom(1.2))
+        self.bind("<minus>",     lambda e: self._zoom(1 / 1.2))
+        self.bind("<underscore>", lambda e: self._zoom(1 / 1.2))
+        self.bind("<0>",         lambda e: self._zoom_reset())
+
+        # Delete from list
+        self.bind("<Delete>",  lambda e: self._remove_current_from_list())
 
     # ──────────────────────────────────────────────────────────
     # Clock / Status helpers
@@ -1597,9 +2036,33 @@ class NextLevelOCRScanner(ctk.CTk):
             text=datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
         self.after(1000, self._tick_clock)
 
+    def _refresh_today_label(self):
+        today = _db.get_today_stats().get("today", 0)
+        self._today_label.configure(text=f"Today: {today} scans")
+        self.after(60_000, self._refresh_today_label)   # refresh every minute
+
     def set_status(self, msg: str):
         self._status_label.configure(text=msg)
         logger.debug("Status: %s", msg)
+
+    def _show_toast(self, msg: str, color: str = "#1E293B",
+                    text_color: str = "#00FFAA", duration_ms: int = 2500):
+        """Display a brief floating toast notification near the bottom of the window."""
+        try:
+            tw = tk.Toplevel(self)
+            tw.wm_overrideredirect(True)
+            # Position at bottom-centre of main window
+            rx = self.winfo_rootx() + self.winfo_width() // 2
+            ry = self.winfo_rooty() + self.winfo_height() - 70
+            tw.wm_geometry(f"+{rx - 150}+{ry}")
+            lbl = tk.Label(tw, text=msg, justify="center",
+                           background=color, foreground=text_color,
+                           font=("Segoe UI", 11), relief="flat",
+                           padx=18, pady=8, bd=1)
+            lbl.pack()
+            tw.after(duration_ms, tw.destroy)
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────────────────
     # Image management
@@ -1616,14 +2079,17 @@ class NextLevelOCRScanner(ctk.CTk):
             w.destroy()
         self.image_files  = []
         self.file_buttons = {}
+        self._thumb_refs  = {}
         for f in sorted(os.listdir(dir_path)):
             if f.lower().endswith(_SUPPORTED_EXTENSIONS):
                 self.image_files.append(os.path.join(dir_path, f))
         for path in self.image_files:
             self._add_file_button(path)
         n = len(self.image_files)
+        self._file_count_label.configure(text=f"({n})")
         self.set_status(f"Loaded {n} image{'s' if n != 1 else ''} from: {dir_path}")
         logger.info("Directory loaded: %s (%d images)", dir_path, n)
+        self._update_nav_buttons()
         if self.image_files:
             self.display_image(self.image_files[0])
             if _config.get("auto_scan_on_load"):
@@ -1640,8 +2106,11 @@ class NextLevelOCRScanner(ctk.CTk):
             w.destroy()
         self.image_files  = [path]
         self.file_buttons = {}
+        self._thumb_refs  = {}
         self._add_file_button(path)
+        self._file_count_label.configure(text="(1)")
         self.display_image(path)
+        self._update_nav_buttons()
         self.set_status(f"File loaded: {os.path.basename(path)}")
 
     def load_zip_file(self):
@@ -1662,19 +2131,53 @@ class NextLevelOCRScanner(ctk.CTk):
             messagebox.showerror("Error", f"Failed to extract ZIP:\n{exc}")
 
     def _add_file_button(self, path: str):
-        btn = ctk.CTkButton(
-            self.scrollable_file_list, text=os.path.basename(path),
-            anchor="w", fg_color="transparent",
-            text_color="white", hover_color="gray40",
-            command=lambda p=path: self.display_image(p)
-        )
-        btn.pack(fill='x', pady=1)
+        if _config.get("show_thumbnails", True):
+            row_frame = ctk.CTkFrame(
+                self.scrollable_file_list, fg_color="transparent", corner_radius=4)
+            row_frame.pack(fill='x', pady=1)
+            row_frame.grid_columnconfigure(1, weight=1)
+
+            # Thumbnail placeholder — loaded lazily in background
+            thumb_label = ctk.CTkLabel(row_frame, text="", width=_THUMB_W, height=_THUMB_H,
+                                        fg_color="#1E293B", corner_radius=2)
+            thumb_label.grid(row=0, column=0, padx=(2, 4), pady=2)
+
+            btn = ctk.CTkButton(
+                row_frame, text=os.path.basename(path),
+                anchor="w", fg_color="transparent",
+                text_color="#CBD5E1", hover_color="#334155",
+                font=ctk.CTkFont(size=10),
+                command=lambda p=path: self.display_image(p)
+            )
+            btn.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+
+            # Load thumbnail in background
+            def _load_thumb(p=path, lbl=thumb_label):
+                try:
+                    img = Image.open(p)
+                    img.thumbnail((_THUMB_W, _THUMB_H))
+                    tk_img = ImageTk.PhotoImage(img)
+                    self._thumb_refs[p] = tk_img
+                    lbl.after(0, lambda i=tk_img: lbl.configure(image=i, text=""))
+                except Exception:
+                    pass
+            threading.Thread(target=_load_thumb, daemon=True).start()
+        else:
+            btn = ctk.CTkButton(
+                self.scrollable_file_list, text=os.path.basename(path),
+                anchor="w", fg_color="transparent",
+                text_color="white", hover_color="gray40",
+                command=lambda p=path: self.display_image(p)
+            )
+            btn.pack(fill='x', pady=1)
         self.file_buttons[path] = btn
 
     def display_image(self, path: str):
         self.current_image_path = path
+        self._rotation_angle = 0   # reset rotation when loading new image
         for p, btn in self.file_buttons.items():
-            btn.configure(fg_color="gray25" if p == path else "transparent")
+            is_active = (p == path)
+            btn.configure(fg_color="#1E3A5F" if is_active else "transparent")
         # Clear previous OCR boxes when a new image is loaded
         self._ocr_boxes_easy = []
         self._ocr_boxes_tess = []
@@ -1682,11 +2185,15 @@ class NextLevelOCRScanner(ctk.CTk):
             self._base_pil_img = Image.open(path)
             self._zoom_factor  = 1.0
             self._render_image()
-            self._img_name_label.configure(text=os.path.basename(path))
+            idx = self.image_files.index(path) + 1 if path in self.image_files else "?"
+            total = len(self.image_files)
+            self._img_name_label.configure(
+                text=f"[{idx}/{total}]  {os.path.basename(path)}")
             self.update_textbox(self.smart_data_box,
                                 "--- Ready ---\nPress START SCAN or Ctrl+S.")
             self.update_textbox(self.raw_data_box, "Image loaded. Ready for OCR.")
             self.set_status(f"Preview: {os.path.basename(path)}")
+            self._update_nav_buttons()
         except Exception as exc:
             logger.error("display_image error: %s", exc)
             self._preview_canvas.delete("all")
@@ -1707,7 +2214,12 @@ class NextLevelOCRScanner(ctk.CTk):
         if ch <= 1:
             ch = _DEFAULT_PREVIEW_H
 
-        img      = self._base_pil_img.copy()
+        img = self._base_pil_img.copy()
+
+        # Apply cumulative rotation
+        if self._rotation_angle % 360 != 0:
+            img = img.rotate(-self._rotation_angle, expand=True)
+
         orig_w, orig_h = img.size
 
         # Compute display size respecting zoom and canvas bounds
@@ -1741,6 +2253,13 @@ class NextLevelOCRScanner(ctk.CTk):
         if self._show_boxes:
             self._draw_boxes_on_canvas(hit_only=True)
 
+        # Update zoom percentage label
+        zoom_pct = int(self._zoom_factor * 100)
+        try:
+            self._zoom_label.configure(text=f"{zoom_pct}%")
+        except Exception:
+            pass
+
     def _zoom(self, factor: float):
         self._zoom_factor = max(_MIN_ZOOM, min(self._zoom_factor * factor, _MAX_ZOOM))
         self._render_image()
@@ -1748,6 +2267,128 @@ class NextLevelOCRScanner(ctk.CTk):
     def _zoom_reset(self):
         self._zoom_factor = 1.0
         self._render_image()
+
+    def _fit_to_window(self):
+        """Scale zoom so the image fits exactly within the canvas."""
+        if self._base_pil_img is None:
+            return
+        canvas = self._preview_canvas
+        cw = max(canvas.winfo_width(), _DEFAULT_PREVIEW_W)
+        ch = max(canvas.winfo_height(), _DEFAULT_PREVIEW_H)
+        img = self._base_pil_img
+        if self._rotation_angle % 180 != 0:
+            ow, oh = img.size[1], img.size[0]
+        else:
+            ow, oh = img.size
+        ratio = min((cw - 20) / max(ow, 1), (ch - 20) / max(oh, 1))
+        self._zoom_factor = max(_MIN_ZOOM, min(ratio, _MAX_ZOOM))
+        self._render_image()
+
+    def _rotate_image(self, angle: int):
+        """Rotate the preview by *angle* degrees (positive = clockwise)."""
+        if self._base_pil_img is None:
+            return
+        self._rotation_angle = (self._rotation_angle + angle) % 360
+        # Clear bounding boxes since they no longer match the rotated view
+        self._ocr_boxes_easy = []
+        self._ocr_boxes_tess = []
+        self._render_image()
+        self.set_status(f"🔄 Rotated {self._rotation_angle}°")
+
+    def _deskew_current(self):
+        """Auto-detect and correct the skew of the currently displayed image."""
+        if self._base_pil_img is None:
+            self.set_status("⚠️  No image loaded.")
+            return
+        self.set_status("📐 Deskewing…")
+        original = self._base_pil_img.copy()
+        def _do():
+            corrected = deskew_image(original)
+            self.after(0, self._apply_deskewed, corrected)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _apply_deskewed(self, corrected_img: Image.Image):
+        self._base_pil_img = corrected_img
+        self._rotation_angle = 0
+        self._ocr_boxes_easy = []
+        self._ocr_boxes_tess = []
+        self._render_image()
+        self.set_status("📐 Deskew applied.")
+        self._show_toast("📐 Deskew applied!", color="#0F172A", text_color="#38BDF8")
+
+    def _navigate(self, direction: int):
+        """Move to the previous (-1) or next (+1) image in the list."""
+        if not self.image_files or not self.current_image_path:
+            return
+        try:
+            idx = self.image_files.index(self.current_image_path)
+        except ValueError:
+            return
+        new_idx = idx + direction
+        if 0 <= new_idx < len(self.image_files):
+            self.display_image(self.image_files[new_idx])
+
+    def _update_nav_buttons(self):
+        """Enable/disable Prev/Next buttons based on current position."""
+        if not self.image_files or not self.current_image_path:
+            self._btn_prev.configure(state="disabled")
+            self._btn_next.configure(state="disabled")
+            return
+        try:
+            idx = self.image_files.index(self.current_image_path)
+        except ValueError:
+            return
+        self._btn_prev.configure(state="normal" if idx > 0 else "disabled")
+        self._btn_next.configure(state="normal" if idx < len(self.image_files) - 1 else "disabled")
+
+    def _clear_file_list(self):
+        """Remove all images from the file list."""
+        for w in self.scrollable_file_list.winfo_children():
+            w.destroy()
+        self.image_files  = []
+        self.file_buttons = {}
+        self._thumb_refs  = {}
+        self.current_image_path = ""
+        self._file_count_label.configure(text="")
+        self._preview_canvas.delete("all")
+        self._preview_canvas.create_text(
+            400, 300, text="No Image Selected",
+            fill="gray40", font=("Segoe UI", 16), tags="placeholder")
+        self._base_pil_img = None
+        self._update_nav_buttons()
+        self.set_status("File list cleared.")
+
+    def _remove_current_from_list(self):
+        """Remove the currently selected image from the list."""
+        if not self.current_image_path:
+            return
+        path = self.current_image_path
+        try:
+            idx = self.image_files.index(path)
+        except ValueError:
+            return
+        # Determine next image to display
+        self.image_files.remove(path)
+        btn = self.file_buttons.pop(path, None)
+        if btn:
+            try:
+                btn.master.destroy()  # destroy thumbnail row frame (if using thumbnails)
+            except Exception:
+                try:
+                    btn.destroy()
+                except Exception:
+                    pass
+        self._thumb_refs.pop(path, None)
+        self._file_count_label.configure(text=f"({len(self.image_files)})")
+        if self.image_files:
+            next_idx = min(idx, len(self.image_files) - 1)
+            self.display_image(self.image_files[next_idx])
+        else:
+            self.current_image_path = ""
+            self._base_pil_img = None
+            self._preview_canvas.delete("all")
+            self._update_nav_buttons()
+        self.set_status(f"Removed: {os.path.basename(path)}")
 
     # ──────────────────────────────────────────────────────────
     # Bounding-box overlay
@@ -2115,9 +2756,10 @@ class NextLevelOCRScanner(ctk.CTk):
     def _run_single_scan(self, image_path: str):
         t0 = time.time()
         try:
+            auto_deskew = _config.get("auto_deskew", False)
             original_img = Image.open(image_path)
-            img_tess     = preprocess_image(original_img)
-            img_easy     = preprocess_for_easyocr(original_img)
+            img_tess     = preprocess_image(original_img, auto_deskew=auto_deskew)
+            img_easy     = preprocess_for_easyocr(original_img, auto_deskew=auto_deskew)
 
             # 3 workers: Tesseract text, EasyOCR text+boxes, Tesseract word boxes
             with ThreadPoolExecutor(max_workers=3) as ex:
@@ -2150,7 +2792,7 @@ class NextLevelOCRScanner(ctk.CTk):
 
             smart_out, raw_out = self._format_output(
                 engine_label, receipt_type, metadata, extracted_text,
-                easy_text, elapsed_ms)
+                easy_text, elapsed_ms, easy_conf)
 
             self.after(0, self._finish_single_scan,
                        smart_out, raw_out, metadata, receipt_type,
@@ -2168,21 +2810,27 @@ class NextLevelOCRScanner(ctk.CTk):
                        f"CRITICAL ERROR\n{exc}", str(exc), None, "unknown", 0, "", [], [])
 
     def _format_output(self, engine_label, receipt_type, metadata,
-                       extracted_text, easy_text, elapsed_ms):
+                       extracted_text, easy_text, elapsed_ms, easy_conf: float = 0.0):
         type_label = {
             "type1_web":   "🌐 Type 1 — Web UI (vertical labels)",
             "type2_vetc":  "📱 Type 2 — VETC App (key:value)",
         }.get(receipt_type, "❓ Unknown")
 
+        conf_bar = ""
+        if metadata and easy_conf > 0:
+            filled = int(easy_conf * 20)
+            conf_bar = f"\n🎯 Conf: [{'█' * filled}{'░' * (20 - filled)}] {easy_conf * 100:.1f}%"
+
         smart = (f"🔬 Engine:  {engine_label}\n"
                  f"📋 Type:    {type_label}\n"
-                 f"⏱  Time:    {elapsed_ms} ms\n"
-                 + "─" * 40 + "\n\n")
+                 f"⏱  Time:    {elapsed_ms} ms"
+                 + conf_bar + "\n"
+                 + "─" * 44 + "\n\n")
         if metadata:
             for k, v in metadata.items():
                 smart += f"► {k}:\n   [ {v} ]\n\n"
         else:
-            smart += "No receipt data found. Check Raw OCR Text tab."
+            smart += "⚠️  No receipt data found.\nCheck Raw OCR Text tab for raw output."
 
         raw = "=== MERGED OCR TEXT ===\n"
         raw += extracted_text.strip() or "[No text found]"
@@ -2213,11 +2861,17 @@ class NextLevelOCRScanner(ctk.CTk):
         self.btn_scan.configure(state="normal", text="▶  START SCAN  (Ctrl+S)")
         self._scan_lock.release()
         self._refresh_stats_label()
+        self._refresh_today_label()
+        fields_n = len(metadata) if metadata else 0
         status = (f"✅ Done in {elapsed_ms} ms | "
                   f"Engine: {engine_label} | "
-                  f"Fields: {len(metadata) if metadata else 0} | "
+                  f"Fields: {fields_n} | "
                   f"Boxes: {easy_n} Easy / {tess_n} Tess")
         self.set_status(status)
+        # Show toast only when scan actually produced fields
+        if fields_n > 0:
+            self._show_toast(f"✅ {fields_n} fields extracted in {elapsed_ms} ms",
+                             color="#0F2027", text_color="#34D399")
         logger.info("Single scan done: %dms, fields=%d",
                     elapsed_ms, len(metadata) if metadata else 0)
 
@@ -2249,19 +2903,30 @@ class NextLevelOCRScanner(ctk.CTk):
         success = 0
         failed  = 0
         t_start = time.time()
+        auto_deskew = _config.get("auto_deskew", False)
 
         for idx, image_path in enumerate(self.image_files):
             if self._batch_cancel.is_set():
                 break
             progress = idx / total
             self.after(0, self._batch_progress.set, progress)
+
+            # ETA calculation
+            elapsed_so_far = time.time() - t_start
+            if idx > 0:
+                avg_per_img = elapsed_so_far / idx
+                eta_s = int(avg_per_img * (total - idx))
+                eta_str = f"ETA {eta_s}s"
+            else:
+                eta_str = "…"
             self.after(0, self.set_status,
-                       f"⚡ Batch [{idx + 1}/{total}]: {os.path.basename(image_path)}")
+                       f"⚡ Batch [{idx + 1}/{total}]  {eta_str}: "
+                       f"{os.path.basename(image_path)}")
 
             try:
                 original_img = Image.open(image_path)
-                img_tess     = preprocess_image(original_img)
-                img_easy     = preprocess_for_easyocr(original_img)
+                img_tess     = preprocess_image(original_img, auto_deskew=auto_deskew)
+                img_easy     = preprocess_for_easyocr(original_img, auto_deskew=auto_deskew)
                 t0 = time.time()
                 with ThreadPoolExecutor(max_workers=2) as ex:
                     tess_text            = ex.submit(run_tesseract, img_tess).result()
@@ -2301,6 +2966,7 @@ class NextLevelOCRScanner(ctk.CTk):
         self._batch_progress.set(1)
         self.btn_scan.configure(state="normal", text="▶  START SCAN  (Ctrl+S)")
         self._refresh_stats_label()
+        self._refresh_today_label()
         msg = (f"⚡ Batch complete: {success}/{total} OK, "
                f"{failed} failed — {elapsed_total}s total")
         self.set_status(msg)
@@ -2419,6 +3085,12 @@ class NextLevelOCRScanner(ctk.CTk):
 
     def _open_history(self):
         HistoryDialog(self, _db)
+
+    def _open_statistics(self):
+        StatisticsDialog(self, _db)
+
+    def _open_shortcuts(self):
+        ShortcutsDialog(self)
 
     def _open_settings(self):
         SettingsDialog(self, _config, on_save=self._apply_settings)
