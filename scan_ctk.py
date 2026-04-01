@@ -41,7 +41,7 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
 
 # Supported image file extensions
@@ -61,6 +61,19 @@ _THUMB_H = 46
 
 # Maximum recent files remembered
 _RECENT_FILES_MAX = 10
+
+# Preprocessing brightness thresholds
+_BRIGHT_THRESHOLD      = 180   # above → "light screenshot" path
+_BORDERLINE_BRIGHTNESS = 120   # 120–180 → intermediate path with CLAHE + sharpen
+
+# OCR merge / accuracy constants
+_EASY_LINE_COUNT_RATIO  = 1.2   # EasyOCR must have ≥ this × more lines to win outright
+_MERGE_SIMILARITY_MIN   = 0.45  # minimum SequenceMatcher ratio to prefer EasyOCR for a line
+_EASYOCR_Y_BAND         = 10    # pixel band height for Y-quantized spatial sort
+
+# Post-processing validation minimums
+_MIN_EPC_LENGTH         = 4     # EPC/RFID codes shorter than this are discarded
+_MIN_PLATE_LENGTH       = 5     # licence-plate strings shorter than this are discarded
 
 # Per-field color theming for the structured data panel
 _FIELD_COLORS: dict = {
@@ -91,21 +104,26 @@ _CONFIG_FILE = _CONFIG_DIR / "config.json"
 _LOG_DIR     = _CONFIG_DIR / "logs"
 
 _DEFAULT_CONFIG: dict = {
-    "tesseract_path":     "",
-    "db_path":            str(_CONFIG_DIR / "receipts.db"),
-    "theme":              "Dark",
-    "color_theme":        "blue",
-    "last_directory":     "",
-    "auto_scan_on_load":  False,
-    "log_level":          "INFO",
-    "max_log_size_mb":    10,
-    "log_backup_count":   5,
-    "export_directory":   str(Path.home()),
-    "recent_files":       [],
-    "show_thumbnails":    True,
-    "auto_deskew":        False,
-    "zoom_step":          1.2,
-    "window_geometry":    "",
+    "tesseract_path":         "",
+    "db_path":                str(_CONFIG_DIR / "receipts.db"),
+    "theme":                  "Dark",
+    "color_theme":            "blue",
+    "last_directory":         "",
+    "auto_scan_on_load":      False,
+    "log_level":              "INFO",
+    "max_log_size_mb":        10,
+    "log_backup_count":       5,
+    "export_directory":       str(Path.home()),
+    "recent_files":           [],
+    "show_thumbnails":        True,
+    "auto_deskew":            False,
+    "zoom_step":              1.2,
+    "window_geometry":        "",
+    # v3.0.1 additions
+    "ocr_mode":               "dual",   # "dual" | "tesseract_only" | "easyocr_only"
+    "ocr_confidence_threshold": 0.60,   # min EasyOCR confidence to prefer its output
+    "history_limit":          500,      # max rows shown in the History dialog
+    "batch_preview_interval": 5,        # update preview every N images during batch
 }
 
 
@@ -448,6 +466,44 @@ class DatabaseManager:
             finally:
                 conn.close()
 
+    def export_filtered_csv(self, file_path: str, search: str = "",
+                            limit: int = 5000) -> int:
+        """Dump rows matching *search* to CSV.  Returns number of rows written.
+
+        v3.0.1: Allows exporting only the currently-filtered history view to CSV
+        instead of always dumping every row.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                if search:
+                    escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    q = f'%{escaped}%'
+                    cur.execute('''
+                        SELECT * FROM scans
+                        WHERE transaction_code LIKE ? ESCAPE '\\'
+                           OR license_plate LIKE ? ESCAPE '\\'
+                           OR raw_text LIKE ? ESCAPE '\\'
+                        ORDER BY id DESC LIMIT ?
+                    ''', (q, q, q, limit))
+                else:
+                    cur.execute("SELECT * FROM scans ORDER BY id DESC LIMIT ?", (limit,))
+                rows = cur.fetchall()
+                if not rows:
+                    return 0
+                with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([d[0] for d in cur.description])
+                    writer.writerows(rows)
+                logger.info("Filtered export: %d rows → %s", len(rows), file_path)
+                return len(rows)
+            except Exception as exc:
+                logger.error("Filtered CSV export error: %s", exc)
+                return 0
+            finally:
+                conn.close()
+
 
 # Singleton DB manager (path resolved after config is loaded)
 _db = DatabaseManager(_config["db_path"])
@@ -553,6 +609,10 @@ def preprocess_image(img, auto_deskew: bool = False):
     tránh làm mờ hoặc méo chữ.
 
     If *auto_deskew* is True the image is skew-corrected before binarisation.
+
+    v3.0.1: Added border padding to prevent edge-character clipping by the OCR
+    engine, improved adaptive threshold parameters, and secondary OTSU pass for
+    borderline-brightness images.
     """
     if auto_deskew:
         img = deskew_image(img)
@@ -576,7 +636,7 @@ def preprocess_image(img, auto_deskew: bool = False):
     # Phân tích độ sáng trung bình để phát hiện nền tối / sáng
     mean_brightness = np.mean(gray)
 
-    if mean_brightness > 180:
+    if mean_brightness > _BRIGHT_THRESHOLD:
         # Ảnh sáng (screenshot điện thoại nền trắng): sharpen để tăng độ nét chữ
         kernel = np.array([[ 0, -1,  0],
                             [-1,  5, -1],
@@ -585,6 +645,15 @@ def preprocess_image(img, auto_deskew: bool = False):
         enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
         # Light denoising to remove scanner/compression artifacts
         enhanced = cv2.fastNlMeansDenoising(enhanced, h=5, templateWindowSize=7, searchWindowSize=21)
+    elif mean_brightness > _BORDERLINE_BRIGHTNESS:
+        # Borderline brightness: CLAHE + gentle sharpening
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        kernel = np.array([[ 0, -1,  0],
+                            [-1,  5, -1],
+                            [ 0, -1,  0]], dtype=np.float32)
+        enhanced = cv2.filter2D(enhanced, -1, kernel)
+        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
     else:
         # Ảnh tối / scan thật: dùng CLAHE để tăng tương phản
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -601,10 +670,21 @@ def preprocess_image(img, auto_deskew: bool = False):
         C=8
     )
 
+    # v3.0.1: For borderline images, blend adaptive result with OTSU for better separation
+    if _BORDERLINE_BRIGHTNESS < mean_brightness <= _BRIGHT_THRESHOLD:
+        _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Take the AND of both binarizations — keeps only pixels both methods agree are fg
+        binary = cv2.bitwise_and(binary, otsu)
+
     # Morphological opening with a 2×2 kernel to remove isolated noise pixels
     # without breaking connected character strokes
     kernel_morph = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_morph)
+
+    # v3.0.1: Add a small white border so OCR engines don't clip characters at edges
+    border = max(10, binary.shape[0] // 50)
+    binary = cv2.copyMakeBorder(binary, border, border, border, border,
+                                cv2.BORDER_CONSTANT, value=255)
 
     return Image.fromarray(binary)
 
@@ -614,6 +694,9 @@ def preprocess_for_easyocr(img, auto_deskew: bool = False):
     EasyOCR được huấn luyện trên ảnh màu nên cho kết quả tốt hơn grayscale.
 
     If *auto_deskew* is True the image is skew-corrected first.
+
+    v3.0.1: Added white border padding and an intermediate brightness branch
+    (120–180) that uses CLAHE on the L channel for better tonal separation.
     """
     if auto_deskew:
         img = deskew_image(img)
@@ -637,7 +720,7 @@ def preprocess_for_easyocr(img, auto_deskew: bool = False):
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     mean_brightness = np.mean(gray)
 
-    if mean_brightness > 180:
+    if mean_brightness > _BRIGHT_THRESHOLD:
         # Light image: gentle unsharp-mask style sharpening on the colour image
         kernel = np.array([[ 0, -1,  0],
                             [-1,  5, -1],
@@ -645,13 +728,19 @@ def preprocess_for_easyocr(img, auto_deskew: bool = False):
         bgr = cv2.filter2D(bgr, -1, kernel)
         bgr = np.clip(bgr, 0, 255).astype(np.uint8)
     else:
-        # Dark/scanned image: enhance contrast via CLAHE on the L channel (LAB space)
+        # Dark/scanned image or borderline: enhance contrast via CLAHE on the L channel (LAB space)
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
         l_ch, a_ch, b_ch = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        clip = 2.5 if mean_brightness > _BORDERLINE_BRIGHTNESS else 3.0
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
         l_ch = clahe.apply(l_ch)
         lab = cv2.merge([l_ch, a_ch, b_ch])
         bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    # v3.0.1: Add a small white border so OCR engine doesn't clip edge characters
+    border = max(10, bgr.shape[0] // 50)
+    bgr = cv2.copyMakeBorder(bgr, border, border, border, border,
+                             cv2.BORDER_CONSTANT, value=(255, 255, 255))
 
     # Return as RGB for EasyOCR
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -664,40 +753,49 @@ def preprocess_for_easyocr(img, auto_deskew: bool = False):
 def run_tesseract(pil_img):
     """Chạy Tesseract với config tối ưu cho hai loại hóa đơn.
 
-    Runs PSM 6 (uniform block) and PSM 11 (sparse text) in parallel and returns
-    whichever produces more non-empty lines, giving better coverage for both
-    dense-layout and sparse-layout receipts.
+    Runs PSM 6 (uniform block), PSM 4 (single column), and PSM 11 (sparse text)
+    in parallel and returns whichever produces the most non-empty lines, giving
+    better coverage for dense-layout, single-column, and sparse-layout receipts.
+
+    v3.0.1: Added PSM 4 for single-column receipts (Type 1 web UI format).
     """
-    config_psm6 = (
-        "--psm 6 "
+    _base_cfg = (
         "--oem 3 "
         "--dpi 300 "
         "-c preserve_interword_spaces=1 "
         "-c tessedit_do_invert=0"
     )
-    config_psm11 = (
-        "--psm 11 "
-        "--oem 3 "
-        "--dpi 300 "
-        "-c preserve_interword_spaces=1 "
-        "-c tessedit_do_invert=0"
-    )
+    config_psm4  = f"--psm 4  {_base_cfg}"
+    config_psm6  = f"--psm 6  {_base_cfg}"
+    config_psm11 = f"--psm 11 {_base_cfg}"
     try:
         # ThreadPoolExecutor is appropriate here: pytesseract spawns an external
         # tesseract process for each call, so the GIL is released while waiting,
-        # allowing genuine I/O-bound parallelism between the two PSM runs.
-        with ThreadPoolExecutor(max_workers=2) as ex:
+        # allowing genuine I/O-bound parallelism between the PSM runs.
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            fut4  = ex.submit(pytesseract.image_to_string, pil_img,
+                              lang="vie+eng", config=config_psm4)
             fut6  = ex.submit(pytesseract.image_to_string, pil_img,
                               lang="vie+eng", config=config_psm6)
             fut11 = ex.submit(pytesseract.image_to_string, pil_img,
                               lang="vie+eng", config=config_psm11)
+            text4  = fut4.result()
             text6  = fut6.result()
             text11 = fut11.result()
 
+        lines4  = [l for l in text4.splitlines()  if l.strip()]
         lines6  = [l for l in text6.splitlines()  if l.strip()]
         lines11 = [l for l in text11.splitlines() if l.strip()]
-        # Prefer PSM 11 if it captures meaningfully more content
-        return text11 if len(lines11) > len(lines6) * 1.1 else text6
+
+        # Pick the result with the most non-empty lines
+        # If PSM 11 has ≥10% more than the winner so far, prefer it (good for sparse)
+        best_text, best_lines = max(
+            [(text4, lines4), (text6, lines6)],
+            key=lambda t: len(t[1]),
+        )
+        if len(lines11) > len(best_lines) * 1.1:
+            best_text = text11
+        return best_text
     except Exception:
         # Fallback: try PSM 6 alone
         return pytesseract.image_to_string(pil_img, lang="vie+eng", config=config_psm6)
@@ -706,11 +804,15 @@ def run_tesseract(pil_img):
 def run_easyocr(pil_img):
     """Chạy EasyOCR, sắp xếp kết quả top→bottom, left→right.
 
-    Uses improved readtext parameters:
-    - contrast_ths=0.1  : detect low-contrast text regions
-    - adjust_contrast=0.7: normalize contrast before recognition
-    - text_threshold=0.6 : lower threshold to catch faint characters
-    - link_threshold=0.4 : group nearby text boxes more aggressively
+    v3.0.1: Tuned readtext parameters for better Vietnamese receipt accuracy:
+    - contrast_ths=0.08  : catch even lower-contrast text regions
+    - adjust_contrast=0.8: stronger contrast normalisation before recognition
+    - text_threshold=0.5 : lower threshold to recover faint/thin characters
+    - link_threshold=0.3 : more aggressive neighbouring-box grouping
+    - width_ths=0.7      : allow wider merged boxes (catches long lines)
+    - height_ths=0.5     : allow taller merged boxes
+    Results are sorted spatially (top→bottom, left→right) to match
+    the natural reading order of Vietnamese receipts.
     """
     reader = get_easyocr_reader()
     if reader is None:
@@ -721,12 +823,15 @@ def run_easyocr(pil_img):
             np_img,
             detail=1,
             paragraph=False,
-            contrast_ths=0.1,
-            adjust_contrast=0.7,
-            text_threshold=0.6,
-            link_threshold=0.4,
+            contrast_ths=0.08,
+            adjust_contrast=0.8,
+            text_threshold=0.5,
+            link_threshold=0.3,
+            width_ths=0.7,
+            height_ths=0.5,
         )
-        results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+        # Sort by vertical band first (quantise y to _EASYOCR_Y_BAND-px bands), then x
+        results.sort(key=lambda r: (round(r[0][0][1] / _EASYOCR_Y_BAND) * _EASYOCR_Y_BAND, r[0][0][0]))
         lines = [text for _, text, _ in results]
         confidences = [conf for _, _, conf in results]
         full_text = "\n".join(lines)
@@ -825,38 +930,48 @@ def merge_dual_ocr(tess_text, easy_text, easy_confidence):
     """Merge kết quả Tesseract và EasyOCR theo confidence voting.
     Ưu tiên EasyOCR cho dòng có nhiều số, Tesseract cho text tiếng Việt.
 
-    Threshold tuned down (1.2×, conf ≥ 0.60) so EasyOCR is preferred whenever
-    it extracts meaningfully more content at reasonable confidence.
+    v3.0.1: Uses the configurable ``ocr_confidence_threshold`` from the global
+    config (default 0.60).  Also applies sequence-matcher similarity scoring
+    instead of character-count heuristics for more accurate line pairing.
     """
+    conf_threshold = _config.get("ocr_confidence_threshold", 0.60)
+
     if not easy_text.strip():
         return tess_text
 
     tess_lines = [l for l in tess_text.splitlines() if l.strip()]
     easy_lines = [l for l in easy_text.splitlines() if l.strip()]
 
-    if len(easy_lines) > len(tess_lines) * 1.2 and easy_confidence >= 0.60:
+    if len(easy_lines) > len(tess_lines) * _EASY_LINE_COUNT_RATIO and easy_confidence >= conf_threshold:
         return easy_text
 
     merged = []
+    used_easy = set()
     for t_line in tess_lines:
-        best_easy = None
+        best_easy  = None
         best_score = 0.0
+        best_idx   = -1
         t_stripped = t_line.strip().lower()
-        for e_line in easy_lines:
+        for ei, e_line in enumerate(easy_lines):
+            if ei in used_easy:
+                continue
             e_stripped = e_line.strip().lower()
             if not t_stripped or not e_stripped:
                 continue
-            common = sum(c in e_stripped for c in t_stripped)
-            score = common / max(len(t_stripped), len(e_stripped))
+            # Use SequenceMatcher for accurate similarity (handles reordered chars)
+            score = difflib.SequenceMatcher(None, t_stripped, e_stripped).ratio()
             if score > best_score:
                 best_score = score
-                best_easy = e_line
+                best_easy  = e_line
+                best_idx   = ei
 
         digit_count = sum(c.isdigit() for c in t_line)
         has_numbers = digit_count >= 3
 
-        if best_easy and best_score >= 0.5 and has_numbers and easy_confidence >= 0.60:
+        if (best_easy is not None and best_score >= _MERGE_SIMILARITY_MIN
+                and has_numbers and easy_confidence >= conf_threshold):
             merged.append(best_easy)
+            used_easy.add(best_idx)
         else:
             merged.append(t_line)
 
@@ -867,8 +982,13 @@ def merge_dual_ocr(tess_text, easy_text, easy_confidence):
 # ─────────────────────────────────────────────────────────────────
 
 def correct_numeric_ocr(text):
-    """Sửa các ký tự bị nhận nhầm trong trường thuần số."""
-    text = re.sub(r'[,.\-]', '', text)
+    """Sửa các ký tự bị nhận nhầm trong trường thuần số.
+
+    v3.0.1: Extended mapping covers additional OCR confusion pairs and
+    strips common Vietnamese digit separators (dots, commas, spaces).
+    """
+    # Strip common digit separators first (Vietnamese money: 100.000, 1,000)
+    text = re.sub(r'[,.\-\s]', '', text)
     mapping = {
         'O': '0', 'o': '0', 'D': '0', 'Q': '0', 'C': '0',
         'l': '1', 'I': '1', 'i': '1', '|': '1', ']': '1', '[': '1', 't': '1',
@@ -879,10 +999,15 @@ def correct_numeric_ocr(text):
         'T': '7',
         'B': '8',
         'g': '9', 'q': '9', 'P': '9',
+        # v3.0.1 additions
+        'U': '0', 'u': '0',   # rounded U → 0
+        'e': '6',              # lowercase e can be misread as 6 in small fonts
+        'J': '1',              # J → 1 in condensed fonts
+        'F': '7',              # F → 7 (serif)
     }
     for k, v in mapping.items():
         text = text.replace(k, v)
-    return text.replace(" ", "")
+    return re.sub(r'[^0-9]', '', text)
 
 
 def correct_hex_ocr(text):
@@ -903,13 +1028,24 @@ def correct_hex_ocr(text):
 
 
 def normalize_datetime(text):
-    """Chuẩn hoá chuỗi thời gian về dạng DD/MM/YYYY HH:MM:SS."""
-    # Xoá các ký tự dư thừa do OCR
+    """Chuẩn hoá chuỗi thời gian về dạng DD/MM/YYYY HH:MM:SS.
+
+    v3.0.1: Handles additional OCR artifacts — misread dashes/dots in the date
+    portion and leading/trailing noise characters.
+    """
     text = text.strip()
+    # Strip leading non-alphanumeric characters (OCR noise)
+    text = re.sub(r'^[^\d]+', '', text)
     # Thay thế dấu phân cách thời gian bị nhận sai
     text = re.sub(r'[,;|]', ':', text)
-    # Đảm bảo dấu / trong ngày
+    # Đảm bảo dấu / trong ngày (hỗ trợ cả yyyy-mm-dd và dd-mm-yyyy)
     text = re.sub(r'(\d{2})[-.](\d{2})[-.](\d{4})', r'\1/\2/\3', text)
+    text = re.sub(r'(\d{4})[-.](\d{2})[-.](\d{2})', r'\3/\2/\1', text)
+    # Normalise H:M:S → HH:MM:SS padding
+    def _pad_hms(m):
+        parts = [p.zfill(2) for p in m.group(0).split(':')]
+        return ':'.join(parts)
+    text = re.sub(r'\d{1,2}:\d{1,2}(:\d{1,2})?', _pad_hms, text)
     return text
 
 # ─────────────────────────────────────────────────────────────────
@@ -1107,8 +1243,10 @@ def parse_type2_vetc(text):
     # Mapping pattern → field name chuẩn
     # Lưu ý: các pattern phải xử lý cả trường hợp OCR nhận dạng sai dấu tiếng Việt
     heuristics = {
-        "Mã giao dịch":  [r"M[ãa\*]?[ \t]*giao[ \t]*d[ịi]ch", r"M[ãa][ \t]*GD", r"M[ãa][ \t]*v[eé]"],
-        "Trạng thái":    [r"Tr[ạa]ng[ \t]*th[áa]i", r"T[ìi]nh[ \t]*tr[ạa]ng"],
+        "Mã giao dịch":  [r"M[ãa\*]?[ \t]*giao[ \t]*d[ịi]ch", r"M[ãa][ \t]*GD", r"M[ãa][ \t]*v[eé]",
+                          r"Transaction[ \t]*[Cc]ode", r"Trans\.?[ \t]*ID"],
+        "Trạng thái":    [r"Tr[ạa]ng[ \t]*th[áa]i", r"T[ìi]nh[ \t]*tr[ạa]ng",
+                          r"Status", r"Tr[ạa]ng[ \t]*th[àa]i"],
         # Biển số: bắt cả dạng 'Biến số', 'Bien so', 'Biển số xe', 'BSX'
         "Biển số":       [
             r"Bi[eêếềệểễ][nń][ \t]*s[oôốồổỗộ][ \t]*xe?",
@@ -1116,22 +1254,28 @@ def parse_type2_vetc(text):
             r"\bBKS\b",
             r"\bBSX\b",
             r"Bi[ểe]n[ \t]*ki[eê]m",
+            r"License[ \t]*[Pp]late",
+            r"Plate",
         ],
-        "EPC":           [r"\bEPC\b", r"\bRFID\b", r"M[ãa][ \t]*th[ẻe]"],
-        "TG vào":        [r"TG[ \t]*v[àa]o", r"Gi[ờo][ \t]*v[àa]o", r"Th[ờo]i[ \t]*gian[ \t]*v[àa]o"],
+        "EPC":           [r"\bEPC\b", r"\bRFID\b", r"M[ãa][ \t]*th[ẻe]",
+                          r"EPC[ \t]*[Cc]ode", r"Tag[ \t]*ID"],
+        "TG vào":        [r"TG[ \t]*v[àa]o", r"Gi[ờo][ \t]*v[àa]o",
+                          r"Th[ờo]i[ \t]*gian[ \t]*v[àa]o", r"Entry[ \t]*[Tt]ime"],
         # Id trạm vào phải đứng trước Trạm vào để không bị bắt nhầm
-        "Id trạm vào":   [r"Id[ \t]*tr[ạa]m[ \t]*v[àa]o"],
-        "Trạm vào":      [r"Tr[ạa]m[ \t]*v[àa]o"],
-        "Làn vào":       [r"L[àa]n[ \t]*v[àa]o"],
+        "Id trạm vào":   [r"Id[ \t]*tr[ạa]m[ \t]*v[àa]o", r"Station[ \t]*[Ii]n[ \t]*[Ii][Dd]"],
+        "Trạm vào":      [r"Tr[ạa]m[ \t]*v[àa]o", r"Entry[ \t]*[Ss]tation"],
+        "Làn vào":       [r"L[àa]n[ \t]*v[àa]o", r"Lane[ \t]*[Ii]n"],
         # TG Ra: chỉ khớp 'TG Ra' chứ KHÔNG khớp 'Id trạm ra'
-        "TG ra":         [r"TG[ \t]*[Rr]a\b", r"Gi[ờo][ \t]*[Rr]a\b", r"Th[ờo]i[ \t]*gian[ \t]*[Rr]a\b"],
-        "Id trạm ra":    [r"Id[ \t]*tr[ạa]m[ \t]*ra"],
-        "Trạm ra":       [r"Tr[ạa]m[ \t]*ra"],
+        "TG ra":         [r"TG[ \t]*[Rr]a\b", r"Gi[ờo][ \t]*[Rr]a\b",
+                          r"Th[ờo]i[ \t]*gian[ \t]*[Rr]a\b", r"Exit[ \t]*[Tt]ime"],
+        "Id trạm ra":    [r"Id[ \t]*tr[ạa]m[ \t]*ra", r"Station[ \t]*[Oo]ut[ \t]*[Ii][Dd]"],
+        "Trạm ra":       [r"Tr[ạa]m[ \t]*ra", r"Exit[ \t]*[Ss]tation"],
         # Làn ra: dùng word boundary để không bắt 'Làn vào'
-        "Làn ra":        [r"L[àa]n[ \t]*ra\b"],
-        "Loại vé":       [r"Lo[ạa]i[ \t]*v[eé]"],
-        "Giá tiền":      [r"Gi[áa][ \t]*ti[ềe]n", r"S[ốo][ \t]*ti[ềe]n", r"T[ổo]ng[ \t]*c[ộo]ng"],
-        "Đơn vị":        [r"[ĐDd][ơo]n[ \t]*v[ịi]", r"\bBoo\b"],
+        "Làn ra":        [r"L[àa]n[ \t]*ra\b", r"Lane[ \t]*[Oo]ut"],
+        "Loại vé":       [r"Lo[ạa]i[ \t]*v[eé]", r"Ticket[ \t]*[Tt]ype", r"V[eé][ \t]*lo[ạa]i"],
+        "Giá tiền":      [r"Gi[áa][ \t]*ti[ềe]n", r"S[ốo][ \t]*ti[ềe]n",
+                          r"T[ổo]ng[ \t]*c[ộo]ng", r"Amount", r"Fee", r"Ph[íi]"],
+        "Đơn vị":        [r"[ĐDd][ơo]n[ \t]*v[ịi]", r"\bBoo\b", r"Unit", r"Operator"],
     }
 
     delimiter = r"[\s]*[:;.\-][\s]*"
@@ -1153,7 +1297,11 @@ def parse_type2_vetc(text):
 
 
 def post_process_data(data, receipt_type):
-    """Áp dụng sửa lỗi OCR sau khi parse."""
+    """Áp dụng sửa lỗi OCR sau khi parse.
+
+    v3.0.1: Added minimum-length validation so spurious single-character OCR
+    fragments are discarded; improved price formatting to strip currency symbols.
+    """
     # Trường thuần số
     numeric_fields = [
         "Mã giao dịch", "Id trạm vào", "Id trạm ra",
@@ -1161,12 +1309,21 @@ def post_process_data(data, receipt_type):
     ]
     for field in numeric_fields:
         if field in data and data[field]:
-            data[field] = correct_numeric_ocr(data[field])
+            corrected = correct_numeric_ocr(data[field])
+            # Discard if result is implausibly short (noise) — allow single-digit lanes
+            if corrected:
+                data[field] = corrected
+            else:
+                del data[field]
 
     # EPC / RFID
     for epc_field in ["EPC", "RFID"]:
         if epc_field in data and data[epc_field]:
-            data[epc_field] = correct_hex_ocr(data[epc_field])
+            corrected = correct_hex_ocr(data[epc_field])
+            if len(corrected) >= _MIN_EPC_LENGTH:   # EPC codes are at least _MIN_EPC_LENGTH hex chars
+                data[epc_field] = corrected
+            else:
+                del data[epc_field]
 
     # Biển số xe: 2 ký tự đầu là tỉnh (số), phần sau giữ nguyên
     if "Biển số" in data:
@@ -1174,11 +1331,23 @@ def post_process_data(data, receipt_type):
         if len(bs) >= 3:
             prefix = correct_numeric_ocr(bs[:2])
             data["Biển số"] = prefix + bs[2:]
+        # Validate minimum plate length (Vietnamese plates: e.g. "51D-123" = 7 chars, min "29A-1" = 5)
+        if len(data["Biển số"]) < _MIN_PLATE_LENGTH:
+            del data["Biển số"]
+
+    # Giá tiền: strip non-numeric suffixes like "VND", "đ", "VNĐ"
+    if "Giá tiền" in data:
+        price = re.sub(r'[^\d]', '', data["Giá tiền"])
+        if price:
+            data["Giá tiền"] = price
 
     # Thời gian
     for time_field in ["TG vào", "TG ra", "Thời gian vào", "Thời gian ra"]:
         if time_field in data:
             data[time_field] = normalize_datetime(data[time_field])
+
+    # Discard any field whose value is empty after corrections
+    data = {k: v for k, v in data.items() if v and str(v).strip()}
 
     return data
 
@@ -1236,7 +1405,7 @@ class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent, cfg: dict, on_save):
         super().__init__(parent)
         self.title("⚙️ Settings")
-        self.geometry("580x560")
+        self.geometry("600x680")
         self.resizable(False, False)
         self.grab_set()           # modal
         self._cfg    = cfg
@@ -1265,6 +1434,15 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkButton(db_frame, text="Browse", width=70,
                       command=self._browse_db).pack(side='left', padx=(6, 0))
 
+        # Export directory
+        ctk.CTkLabel(self, text="Default Export Directory:", anchor="w").pack(fill='x', **pad)
+        exp_frame = ctk.CTkFrame(self, fg_color="transparent")
+        exp_frame.pack(fill='x', padx=20, pady=0)
+        self._export_var = ctk.StringVar(value=cfg.get("export_directory", str(Path.home())))
+        ctk.CTkEntry(exp_frame, textvariable=self._export_var).pack(side='left', fill='x', expand=True)
+        ctk.CTkButton(exp_frame, text="Browse", width=70,
+                      command=self._browse_export_dir).pack(side='left', padx=(6, 0))
+
         # Theme
         ctk.CTkLabel(self, text="Appearance Theme:", anchor="w").pack(fill='x', **pad)
         self._theme_var = ctk.StringVar(value=cfg.get("theme", "Dark"))
@@ -1276,6 +1454,26 @@ class SettingsDialog(ctk.CTkToplevel):
         self._log_var = ctk.StringVar(value=cfg.get("log_level", "INFO"))
         ctk.CTkOptionMenu(self, variable=self._log_var,
                           values=["DEBUG", "INFO", "WARNING", "ERROR"]).pack(fill='x', padx=20, pady=0)
+
+        # OCR mode (v3.0.1)
+        ctk.CTkLabel(self, text="OCR Mode:", anchor="w").pack(fill='x', **pad)
+        self._ocr_mode_var = ctk.StringVar(value=cfg.get("ocr_mode", "dual"))
+        ctk.CTkOptionMenu(self, variable=self._ocr_mode_var,
+                          values=["dual", "tesseract_only", "easyocr_only"]
+                          ).pack(fill='x', padx=20, pady=0)
+
+        # EasyOCR confidence threshold (v3.0.1)
+        conf_frame = ctk.CTkFrame(self, fg_color="transparent")
+        conf_frame.pack(fill='x', padx=20, pady=(8, 0))
+        ctk.CTkLabel(conf_frame, text="EasyOCR Confidence Threshold:",
+                     anchor="w").pack(side='left')
+        self._conf_var = ctk.StringVar(
+            value=str(cfg.get("ocr_confidence_threshold", 0.60)))
+        ctk.CTkEntry(conf_frame, textvariable=self._conf_var, width=60
+                     ).pack(side='left', padx=(8, 0))
+        ctk.CTkLabel(conf_frame, text="(0.0 – 1.0)",
+                     font=ctk.CTkFont(size=10), text_color="gray60"
+                     ).pack(side='left', padx=(4, 0))
 
         # Toggles
         self._auto_var = ctk.BooleanVar(value=cfg.get("auto_scan_on_load", False))
@@ -1315,14 +1513,26 @@ class SettingsDialog(ctk.CTkToplevel):
         if path:
             self._db_var.set(path)
 
+    def _browse_export_dir(self):
+        path = ctk.filedialog.askdirectory(title="Select Default Export Directory")
+        if path:
+            self._export_var.set(path)
+
     def _save(self):
         self._cfg["tesseract_path"]    = self._tess_var.get().strip()
         self._cfg["db_path"]           = self._db_var.get().strip()
+        self._cfg["export_directory"]  = self._export_var.get().strip()
         self._cfg["theme"]             = self._theme_var.get()
         self._cfg["log_level"]         = self._log_var.get()
+        self._cfg["ocr_mode"]          = self._ocr_mode_var.get()
         self._cfg["auto_scan_on_load"] = self._auto_var.get()
         self._cfg["auto_deskew"]       = self._deskew_var.get()
         self._cfg["show_thumbnails"]   = self._thumb_var.get()
+        try:
+            threshold = float(self._conf_var.get())
+            self._cfg["ocr_confidence_threshold"] = max(0.0, min(1.0, threshold))
+        except ValueError:
+            pass   # keep existing value if input is invalid
         save_config(self._cfg)
         if self._on_save:
             self._on_save(self._cfg)
@@ -1363,6 +1573,9 @@ class HistoryDialog(ctk.CTkToplevel):
         ctk.CTkButton(top, text="🗑 Delete", width=80,
                       fg_color="#991B1B", hover_color="#7F1D1D",
                       command=self._delete_selected).pack(side='left', padx=6)
+        ctk.CTkButton(top, text="📊 Export Filtered CSV", fg_color="#1D4ED8",
+                      hover_color="#1E40AF",
+                      command=self._export_filtered_csv).pack(side='left', padx=6)
         ctk.CTkButton(top, text="📊 Export All CSV", fg_color="#B91C1C",
                       hover_color="#991B1B", command=self._export_all_csv).pack(side='right')
 
@@ -1443,7 +1656,8 @@ class HistoryDialog(ctk.CTkToplevel):
 
     def _refresh(self):
         search = self._search_var.get().strip()
-        self._cached_rows = self._db.get_recent_scans(limit=200, search=search)
+        limit  = _config.get("history_limit", 500)
+        self._cached_rows = self._db.get_recent_scans(limit=limit, search=search)
         self._populate(self._cached_rows)
 
     def _reset(self):
@@ -1462,11 +1676,29 @@ class HistoryDialog(ctk.CTkToplevel):
             if self._db.delete_scan(scan_id):
                 self._refresh()
 
+    def _export_filtered_csv(self):
+        """Export only the currently-displayed (filtered) rows to CSV."""
+        ts      = datetime.now().strftime('%Y%m%d_%H%M%S')
+        search  = self._search_var.get().strip()
+        initial = f"history_filtered_{ts}.csv" if search else f"history_export_{ts}.csv"
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile=initial,
+            initialdir=_config.get("export_directory", str(Path.home())),
+            filetypes=[("CSV files", "*.csv")]
+        )
+        if not path:
+            return
+        limit = _config.get("history_limit", 500)
+        count = self._db.export_filtered_csv(path, search=search, limit=limit)
+        messagebox.showinfo("Export", f"Exported {count} records to:\n{path}")
+
     def _export_all_csv(self):
         ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
         path = ctk.filedialog.asksaveasfilename(
             defaultextension=".csv",
             initialfile=f"history_export_{ts}.csv",
+            initialdir=_config.get("export_directory", str(Path.home())),
             filetypes=[("CSV files", "*.csv")]
         )
         if not path:
@@ -1968,13 +2200,24 @@ class NextLevelOCRScanner(ctk.CTk):
             command=self.export_to_json)
         self.btn_export_json.grid(row=0, column=2, sticky="ew", padx=(3, 0))
 
+        # Action buttons row 2 (v3.0.1)
+        af2 = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        af2.grid(row=5, column=0, sticky="ew", padx=16, pady=(4, 0))
+        af2.grid_columnconfigure(0, weight=1)
+
+        self.btn_copy_raw = ctk.CTkButton(
+            af2, text="📋 Copy Raw OCR Text",
+            fg_color="#374151", hover_color="#1F2937",
+            command=self.copy_raw_to_clipboard)
+        self.btn_copy_raw.grid(row=0, column=0, sticky="ew")
+
         # Scan button
         self.btn_scan = ctk.CTkButton(
             self.results_frame, text="▶  START SCAN  (Ctrl+S)",
             font=ctk.CTkFont(size=15, weight="bold"),
             height=48, fg_color="#10B981", hover_color="#059669",
             corner_radius=8, command=self.start_scan_thread)
-        self.btn_scan.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 16))
+        self.btn_scan.grid(row=6, column=0, sticky="ew", padx=16, pady=(8, 16))
 
     def _build_statusbar(self):
         self._status_bar = ctk.CTkFrame(self, height=28, corner_radius=0,
@@ -2771,26 +3014,42 @@ class NextLevelOCRScanner(ctk.CTk):
         t0 = time.time()
         try:
             auto_deskew = _config.get("auto_deskew", False)
+            ocr_mode    = _config.get("ocr_mode", "dual")
             original_img = Image.open(image_path)
             img_tess     = preprocess_image(original_img, auto_deskew=auto_deskew)
             img_easy     = preprocess_for_easyocr(original_img, auto_deskew=auto_deskew)
 
-            # 3 workers: Tesseract text, EasyOCR text+boxes, Tesseract word boxes
-            with ThreadPoolExecutor(max_workers=3) as ex:
-                fut_tess      = ex.submit(run_tesseract,       img_tess)
-                fut_easy      = ex.submit(run_easyocr,         img_easy)
-                fut_tess_boxes = ex.submit(get_tess_word_boxes, img_tess)
-                tess_text              = fut_tess.result()
-                easy_text, easy_conf, easy_boxes = fut_easy.result()
-                tess_boxes             = fut_tess_boxes.result()
+            tess_text  = ""
+            easy_text  = ""
+            easy_conf  = 0.0
+            easy_boxes = []
+            tess_boxes = []
 
-            if easy_text.strip():
-                engine_label   = f"Tesseract + EasyOCR ✅ (conf: {easy_conf * 100:.1f}%)"
-                extracted_text = merge_dual_ocr(tess_text, easy_text, easy_conf)
-            else:
+            if ocr_mode in ("dual", "tesseract_only"):
+                # Run Tesseract text + word boxes in parallel
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    fut_tess       = ex.submit(run_tesseract,       img_tess)
+                    fut_tess_boxes = ex.submit(get_tess_word_boxes, img_tess)
+                    tess_text  = fut_tess.result()
+                    tess_boxes = fut_tess_boxes.result()
+
+            if ocr_mode in ("dual", "easyocr_only"):
+                easy_text, easy_conf, easy_boxes = run_easyocr(img_easy)
+
+            if ocr_mode == "easyocr_only":
+                engine_label   = f"EasyOCR (conf: {easy_conf * 100:.1f}%)"
+                extracted_text = easy_text if easy_text.strip() else tess_text
+            elif ocr_mode == "tesseract_only":
                 engine_label   = "Tesseract only"
-                easy_conf      = 0.0
                 extracted_text = tess_text
+            else:  # dual
+                if easy_text.strip():
+                    engine_label   = f"Tesseract + EasyOCR ✅ (conf: {easy_conf * 100:.1f}%)"
+                    extracted_text = merge_dual_ocr(tess_text, easy_text, easy_conf)
+                else:
+                    engine_label   = "Tesseract only"
+                    easy_conf      = 0.0
+                    extracted_text = tess_text
 
             metadata, receipt_type = parse_receipt(extracted_text)
             elapsed_ms = int((time.time() - t0) * 1000)
@@ -2917,7 +3176,9 @@ class NextLevelOCRScanner(ctk.CTk):
         success = 0
         failed  = 0
         t_start = time.time()
-        auto_deskew = _config.get("auto_deskew", False)
+        auto_deskew      = _config.get("auto_deskew", False)
+        ocr_mode         = _config.get("ocr_mode", "dual")
+        preview_interval = max(1, _config.get("batch_preview_interval", 5))
 
         for idx, image_path in enumerate(self.image_files):
             if self._batch_cancel.is_set():
@@ -2942,18 +3203,33 @@ class NextLevelOCRScanner(ctk.CTk):
                 img_tess     = preprocess_image(original_img, auto_deskew=auto_deskew)
                 img_easy     = preprocess_for_easyocr(original_img, auto_deskew=auto_deskew)
                 t0 = time.time()
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    tess_text            = ex.submit(run_tesseract, img_tess).result()
-                    easy_text, conf, _   = ex.submit(run_easyocr,   img_easy).result()
+
+                tess_text = ""
+                easy_text = ""
+                conf      = 0.0
+
+                if ocr_mode in ("dual", "tesseract_only"):
+                    tess_text = run_tesseract(img_tess)
+                if ocr_mode in ("dual", "easyocr_only"):
+                    with ThreadPoolExecutor(max_workers=1) as ex:
+                        easy_text, conf, _ = ex.submit(run_easyocr, img_easy).result()
+
                 elapsed_ms = int((time.time() - t0) * 1000)
 
-                if easy_text.strip():
-                    engine_lbl     = f"Dual (conf {conf * 100:.0f}%)"
-                    extracted_text = merge_dual_ocr(tess_text, easy_text, conf)
-                else:
+                if ocr_mode == "easyocr_only":
+                    engine_lbl     = f"EasyOCR ({conf * 100:.0f}%)"
+                    extracted_text = easy_text if easy_text.strip() else tess_text
+                elif ocr_mode == "tesseract_only":
                     engine_lbl     = "Tesseract"
-                    conf           = 0.0
                     extracted_text = tess_text
+                else:  # dual
+                    if easy_text.strip():
+                        engine_lbl     = f"Dual (conf {conf * 100:.0f}%)"
+                        extracted_text = merge_dual_ocr(tess_text, easy_text, conf)
+                    else:
+                        engine_lbl     = "Tesseract"
+                        conf           = 0.0
+                        extracted_text = tess_text
 
                 metadata, receipt_type = parse_receipt(extracted_text)
                 if metadata:
@@ -2964,8 +3240,9 @@ class NextLevelOCRScanner(ctk.CTk):
                                   ocr_confidence=conf)
                 success += 1
 
-                # Show last image in preview
-                self.after(0, self.display_image, image_path)
+                # Update preview every N images to reduce GUI churn
+                if (idx + 1) % preview_interval == 0 or (idx + 1) == total:
+                    self.after(0, self.display_image, image_path)
 
             except Exception as exc:
                 failed += 1
@@ -3037,6 +3314,17 @@ class NextLevelOCRScanner(ctk.CTk):
         else:
             self._flash_button(self.btn_copy, "⚠️ No Data", "📄 Copy JSON")
 
+    def copy_raw_to_clipboard(self):
+        """Copy the Raw OCR Text box contents to the clipboard."""
+        raw_text = self.raw_data_box._textbox.get("1.0", "end").strip()
+        if raw_text and raw_text not in ("Waiting for input…", "Image loaded. Ready for OCR."):
+            self.clipboard_clear()
+            self.clipboard_append(raw_text)
+            self._flash_button(self.btn_copy_raw, "✅ Copied!", "📋 Copy Raw OCR Text")
+            self.set_status("Raw OCR text copied to clipboard.")
+        else:
+            self._flash_button(self.btn_copy_raw, "⚠️ No Text", "📋 Copy Raw OCR Text")
+
     def export_to_csv(self):
         if not self.latest_metadata:
             self._flash_button(self.btn_export_csv, "⚠️ No Data", "📊 CSV")
@@ -3045,6 +3333,7 @@ class NextLevelOCRScanner(ctk.CTk):
         path = ctk.filedialog.asksaveasfilename(
             defaultextension=".csv",
             initialfile=f"receipt_{ts}.csv",
+            initialdir=_config.get("export_directory", str(Path.home())),
             filetypes=[("CSV files", "*.csv")]
         )
         if not path:
@@ -3069,6 +3358,7 @@ class NextLevelOCRScanner(ctk.CTk):
         path = ctk.filedialog.asksaveasfilename(
             defaultextension=".json",
             initialfile=f"receipt_{ts}.json",
+            initialdir=_config.get("export_directory", str(Path.home())),
             filetypes=[("JSON files", "*.json")]
         )
         if not path:
@@ -3128,9 +3418,11 @@ class NextLevelOCRScanner(ctk.CTk):
                 self._scan_lock.release()
         log_level = getattr(logging, cfg.get("log_level", "INFO"), logging.INFO)
         logging.getLogger(APP_NAME).setLevel(log_level)
-        self.set_status("Settings applied.")
-        logger.info("Settings applied: theme=%s, tess=%s, db=%s",
-                    cfg.get("theme"), cfg.get("tesseract_path"), cfg.get("db_path"))
+        self.set_status(
+            f"Settings applied — OCR mode: {cfg.get('ocr_mode', 'dual')}")
+        logger.info("Settings applied: theme=%s, tess=%s, db=%s, ocr_mode=%s",
+                    cfg.get("theme"), cfg.get("tesseract_path"),
+                    cfg.get("db_path"), cfg.get("ocr_mode", "dual"))
 
     # ──────────────────────────────────────────────────────────
     # Stats
