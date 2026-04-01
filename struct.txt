@@ -1,0 +1,133 @@
+133: def load_config() -> dict:
+149: def save_config(cfg: dict) -> None:
+165: def _setup_logging(cfg: dict) -> logging.Logger:
+203: def configure_tesseract(cfg: dict) -> None:
+225: class DatabaseManager:
+241:     def __init__(self, db_path: str) -> None:
+246:     def _connect(self) -> sqlite3.Connection:
+251:     def init_schema(self) -> None:
+302:     def save_scan(self, data: dict, raw_text: str, receipt_type: str = "unknown",
+355:     def get_recent_scans(self, limit: int = 200, search: str = "") -> list:
+389:     def get_statistics(self) -> dict:
+409:     def get_today_stats(self) -> dict:
+435:     def delete_scan(self, scan_id: int) -> bool:
+450:     def export_all_csv(self, file_path: str) -> int:
+472:     def export_filtered_csv(self, file_path: str, search: str = "",
+510:     def transaction_exists(self, tx_code: str) -> dict | None:
+546:     def export_filtered_json(self, file_path: str, search: str = "",
+609:     def export_all_json(self, file_path: str) -> int:
+658: def get_easyocr_reader():
+684: def detect_skew_angle(gray_img: np.ndarray) -> float:
+721: def deskew_image(pil_img: Image.Image) -> Image.Image:
+744: def preprocess_image(img, auto_deskew: bool = False):
+833: def preprocess_for_easyocr(img, auto_deskew: bool = False):
+894: def run_tesseract(pil_img):
+945: def run_easyocr(pil_img):
+985: def _group_tess_boxes_to_lines(word_boxes: list[tuple]) -> list[tuple]:
+1042: def get_tess_word_boxes(pil_img) -> list:
+1070: def merge_dual_ocr(tess_text, easy_text, easy_confidence):
+1125: def correct_numeric_ocr(text):
+1154: def correct_hex_ocr(text):
+1171: def normalize_datetime(text):
+1186:     def _pad_hms(m):
+1210: def detect_receipt_type(text):
+1255: def parse_type1_web(text):
+1374: def parse_type2_vetc(text):
+1440: def post_process_data(data, receipt_type):
+1496: def parse_receipt(text):
+1543: class SettingsDialog(ctk.CTkToplevel):
+1546:     def __init__(self, parent, cfg: dict, on_save):
+1648:     def _browse_tesseract(self):
+1656:     def _browse_db(self):
+1665:     def _browse_export_dir(self):
+1670:     def _save(self):
+1696: class HistoryDialog(ctk.CTkToplevel):
+1706:     def __init__(self, parent, db: DatabaseManager):
+1777:     def _sort_by(self, col: str):
+1786:     def _populate(self, rows: list):
+1814:     def _refresh(self):
+1820:     def _reset(self):
+1824:     def _delete_selected(self):
+1836:     def _export_filtered_csv(self):
+1853:     def _export_all_csv(self):
+1866:     def _export_filtered_json(self):
+1903:     def _export_all_json(self):
+1941: class ShortcutsDialog(ctk.CTkToplevel):
+1964:     def __init__(self, parent):
+2001: class StatisticsDialog(ctk.CTkToplevel):
+2004:     def __init__(self, parent, db: DatabaseManager):
+2028:     def _load(self):
+2065: class NextLevelOCRScanner(ctk.CTk):
+2068:     def __init__(self):
+2121:     def _on_close(self):
+2135:     def _build_sidebar(self):
+2229:     def _build_preview(self):
+2333:     def _build_results(self):
+2453:     def _build_statusbar(self):
+2473:     def _bind_shortcuts(self):
+2517:     def _tick_clock(self):
+2522:     def _refresh_today_label(self):
+2527:     def set_status(self, msg: str):
+2531:     def _show_toast(self, msg: str, color: str = "#1E293B",
+2554:     def load_directory(self, dir_path: str = ""):
+2588:     def load_file(self):
+2607:     def load_zip_file(self):
+2624:     def _add_file_button(self, path: str):
+2651:             def _load_thumb(p=path, lbl=thumb_label):
+2672:     def display_image(self, path: str):
+2701:     def _render_image(self):
+2760:     def _zoom(self, factor: float):
+2764:     def _zoom_reset(self):
+2768:     def _fit_to_window(self):
+2784:     def _rotate_image(self, angle: int):
+2795:     def _deskew_current(self):
+2802:         def _do():
+2807:     def _apply_deskewed(self, corrected_img: Image.Image):
+2816:     def _navigate(self, direction: int):
+2828:     def _update_nav_buttons(self):
+2841:     def _clear_file_list(self):
+2859:     def _remove_current_from_list(self):
+2895:     def _box_conf_color_rgb(conf: float) -> tuple:
+2903:     def _draw_boxes_on_image(
+2936:         def _label(text: str, conf: float) -> str:
+2974:     def _draw_boxes_on_canvas(self, hit_only: bool = False):
+2995:         def _conf_color(conf: float) -> tuple[str, int]:
+3003:         def _draw_quad(pts_screen: list, text: str, conf: float, tag: str):
+3099:     def _on_canvas_scroll(self, event):
+3106:     def _on_canvas_click(self, event):
+3117:     def _on_canvas_hover(self, _event):
+3120:     def _on_canvas_leave(self, _event):
+3123:     def _on_box_click(self, text: str, conf: float, source: str):
+3145:     def _show_box_tooltip(self, event, text: str, conf: float, source: str):
+3160:     def _hide_tooltip(self):
+3172:     def _toggle_boxes(self):
+3182:     def _on_box_source_change(self, value: str):
+3190:     def _ocr_text_search(self):
+3215:     def _ocr_text_clear_search(self):
+3225:     def update_textbox(self, textbox, text: str):
+3231:     def start_scan_thread(self):
+3253:     def _run_single_scan(self, image_path: str):
+3325:     def _format_output(self, engine_label, receipt_type, metadata,
+3355:     def _finish_single_scan(self, smart_text, raw_text, metadata,
+3424:     def start_batch_scan(self):
+3443:     def _run_batch_scan(self):
+3523:     def _finish_batch_scan(self, total, success, failed, elapsed_total):
+3546:     def save_annotated_image(self):
+3576:     def copy_data_to_clipboard(self):
+3586:     def copy_raw_to_clipboard(self):
+3597:     def export_to_csv(self):
+3622:     def export_to_json(self):
+3651:     def _flash_button(self, btn, temp_text: str, orig_text: str, delay: int = 2000):
+3659:     def _open_history(self):
+3662:     def _open_statistics(self):
+3665:     def _open_shortcuts(self):
+3668:     def _open_settings(self):
+3671:     def _apply_settings(self, cfg: dict):
+3700:     def _refresh_stats_label(self):
+3715:     def paste_image_from_clipboard(self):
+3785:     def _load_single_file_into_list(self, path: str):
+3806:     def _open_recent_dirs(self):
+3844:             def _make_row(p: str, idx: int):
+3870:                 def _click(path=p, ok=exists):
+3886:                 def _remove(path=p):
+3909:         def _clear_all():

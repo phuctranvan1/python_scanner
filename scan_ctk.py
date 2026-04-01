@@ -18,6 +18,7 @@ import csv
 import json
 import difflib
 import sqlite3
+import openpyxl
 from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -41,8 +42,18 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "3.0.2"
+APP_VERSION = "4.0.2"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
+# Changelog v4.0.1:
+#   - Quick field-copy buttons in Structured Data panel
+#   - Image info overlay (W×H px, file size, format)
+#   - Export current scan to XLSX (single-scan)
+#   - Auto-scan on navigate option (config: auto_scan_on_navigate)
+#   - Colorized confidence bar (green/yellow/red)
+#   - New shortcuts: Ctrl+B (batch), Ctrl+Z (zoom reset), Ctrl+I (info)
+#   - Fade-in toast animation
+#   - Settings: auto_scan_on_navigate toggle
+#   - Week activity mini-chart in Statistics dialog
 
 # Supported image file extensions
 _SUPPORTED_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp')
@@ -77,23 +88,23 @@ _MIN_PLATE_LENGTH       = 5     # licence-plate strings shorter than this are di
 
 # Per-field color theming for the structured data panel
 _FIELD_COLORS: dict = {
-    "Mã giao dịch":  "#FFD700",   # gold
-    "Biển số":       "#60A5FA",   # sky blue
-    "EPC":           "#A78BFA",   # violet
-    "Giá tiền":      "#34D399",   # emerald
-    "Trạng thái":    "#F87171",   # red
-    "TG vào":        "#FB923C",   # orange
-    "TG ra":         "#FB923C",
-    "Thời gian vào": "#FB923C",
-    "Thời gian ra":  "#FB923C",
-    "Trạm vào":      "#38BDF8",   # light blue
-    "Trạm ra":       "#38BDF8",
-    "Id trạm vào":   "#94A3B8",   # slate
-    "Id trạm ra":    "#94A3B8",
-    "Làn vào":       "#C084FC",   # purple
-    "Làn ra":        "#C084FC",
-    "Loại vé":       "#4ADE80",   # green
-    "Đơn vị":        "#F9A8D4",   # pink
+    "Mã giao dịch":  "#00FF00",   # neon green
+    "Biển số":       "#39FF14",   # hacker green
+    "EPC":           "#00FF00",   # neon green
+    "Giá tiền":      "#32CD32",   # lime green
+    "Trạng thái":    "#7CFC00",   # lawn green
+    "TG vào":        "#00FA9A",   # medium spring green
+    "TG ra":         "#00FA9A",
+    "Thời gian vào": "#00FA9A",
+    "Thời gian ra":  "#00FA9A",
+    "Trạm vào":      "#00FF7F",   # spring green
+    "Trạm ra":       "#00FF7F",
+    "Id trạm vào":   "#228B22",   # forest green
+    "Id trạm ra":    "#228B22",
+    "Làn vào":       "#00EE00",
+    "Làn ra":        "#00EE00",
+    "Loại vé":       "#ADFF2F",   # green yellow
+    "Đơn vị":        "#9ACD32",   # yellow green
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -107,7 +118,7 @@ _DEFAULT_CONFIG: dict = {
     "tesseract_path":         "",
     "db_path":                str(_CONFIG_DIR / "receipts.db"),
     "theme":                  "Dark",
-    "color_theme":            "blue",
+    "color_theme":            "green",
     "last_directory":         "",
     "auto_scan_on_load":      False,
     "log_level":              "INFO",
@@ -127,6 +138,10 @@ _DEFAULT_CONFIG: dict = {
     # v3.0.2 additions
     "recent_directories":     [],       # MRU directory list (newest first, max 10)
     "auto_copy_json":         False,    # silently copy JSON to clipboard after each scan
+    # v4.0.1 additions
+    "auto_scan_on_navigate":  False,    # auto-scan when navigating to next/prev image
+    "conf_color_hi":          0.80,     # confidence ≥ this → green
+    "conf_color_lo":          0.60,     # confidence ≥ this → yellow; below → red
 }
 
 
@@ -645,6 +660,67 @@ class DatabaseManager:
             finally:
                 conn.close()
 
+    def export_filtered_xlsx(self, file_path: str, search: str = "", limit: int = 5000) -> int:
+        """Dump rows matching *search* and limit to XLSX."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                if search:
+                    escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    q = f'%{escaped}%'
+                    cur.execute('''SELECT * FROM scans WHERE transaction_code LIKE ? ESCAPE '\\' OR license_plate LIKE ? ESCAPE '\\' OR raw_text LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?''', (q, q, q, limit))
+                else:
+                    cur.execute("SELECT * FROM scans ORDER BY id DESC LIMIT ?", (limit,))
+                rows = cur.fetchall()
+                if not rows: return 0
+                import openpyxl
+                from openpyxl.utils import get_column_letter
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                columns = [d[0] for d in cur.description]
+                ws.append(columns)
+                for row in rows:
+                    ws.append(tuple(row))
+                for col in range(1, len(columns) + 1):
+                    ws.column_dimensions[get_column_letter(col)].width = 15
+                wb.save(file_path)
+                logger.info("Filtered export: %d rows → %s", len(rows), file_path)
+                return len(rows)
+            except Exception as exc:
+                logger.error("Filtered XLSX export error: %s", exc)
+                return 0
+            finally:
+                conn.close()
+
+    def export_all_xlsx(self, file_path: str) -> int:
+        """Dump all rows to XLSX."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM scans ORDER BY id")
+                rows = cur.fetchall()
+                if not rows: return 0
+                import openpyxl
+                from openpyxl.utils import get_column_letter
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                columns = [d[0] for d in cur.description]
+                ws.append(columns)
+                for row in rows:
+                    ws.append(tuple(row))
+                for col in range(1, len(columns) + 1):
+                    ws.column_dimensions[get_column_letter(col)].width = 15
+                wb.save(file_path)
+                logger.info("Full XLSX export: %d rows → %s", len(rows), file_path)
+                return len(rows)
+            except Exception as exc:
+                logger.error("Full XLSX export error: %s", exc)
+                return 0
+            finally:
+                conn.close()
+
 
 # Singleton DB manager (path resolved after config is loaded)
 _db = DatabaseManager(_config["db_path"])
@@ -675,7 +751,7 @@ def get_easyocr_reader():
 
 # Apply CustomTkinter theme from config
 ctk.set_appearance_mode(_config.get("theme", "Dark"))
-ctk.set_default_color_theme(_config.get("color_theme", "blue"))
+ctk.set_default_color_theme(_config.get("color_theme", "green"))
 
 # ─────────────────────────────────────────────────────────────────
 # Image Deskewing
@@ -718,6 +794,54 @@ def detect_skew_angle(gray_img: np.ndarray) -> float:
     return max(-45.0, min(45.0, median_angle))
 
 
+def auto_crop_receipt(img: Image.Image) -> Image.Image:
+    """Smart auto-crop to remove background noise around the receipt."""
+    try:
+        open_cv_image = np.array(img.convert("RGB"))
+        gray = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 50, 150)
+        kernel = np.ones((5, 5), np.uint8)
+        dilated = cv2.dilate(edges, kernel, iterations=1)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return img
+            
+        largest_contour = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        
+        img_h, img_w = gray.shape
+        if (w * h) > 0.3 * (img_w * img_h):
+            margin_x = int(img_w * 0.02)
+            margin_y = int(img_h * 0.02)
+            nx = max(0, x - margin_x)
+            ny = max(0, y - margin_y)
+            nw = min(img_w - nx, w + 2*margin_x)
+            nh = min(img_h - ny, h + 2*margin_y)
+            cropped = open_cv_image[ny:ny+nh, nx:nx+nw]
+            return Image.fromarray(cropped)
+    except Exception as exc:
+        logger.warning("Auto-crop failed: %s", exc)
+    return img
+
+def auto_orient_image(pil_img: Image.Image) -> Image.Image:
+    """Detect text orientation using Tesseract OSD and rotate the image upright."""
+    try:
+        # psm 0 is for OSD (Orientation and Script Detection)
+        osd = pytesseract.image_to_osd(pil_img, config='--psm 0 -c min_characters_to_try=5')
+        match = re.search(r'(?i)Rotate:\s*(\d+)', osd)
+        if match:
+            angle = int(match.group(1))
+            if angle in [90, 180, 270]:
+                logger.info(f"Auto-orient: rotating {angle} degrees")
+                # Tesseract 'Rotate: X' means the image must be rotated X degrees CW to be upright.
+                # PIL's rotate() method uses CCW degrees, so passing -angle performs CW rotation.
+                return pil_img.rotate(-angle, expand=True, resample=Image.Resampling.BICUBIC)
+    except Exception as exc:
+        logger.warning("OSD Auto-orient failed: %s", exc)
+    return pil_img
+
 def deskew_image(pil_img: Image.Image) -> Image.Image:
     """Rotate *pil_img* to correct any detected text skew.
 
@@ -756,6 +880,8 @@ def preprocess_image(img, auto_deskew: bool = False):
     borderline-brightness images.
     """
     if auto_deskew:
+        img = auto_orient_image(img)
+        img = auto_crop_receipt(img)
         img = deskew_image(img)
 
     open_cv_image = np.array(img)
@@ -817,6 +943,16 @@ def preprocess_image(img, auto_deskew: bool = False):
         # Take the AND of both binarizations — keeps only pixels both methods agree are fg
         binary = cv2.bitwise_and(binary, otsu)
 
+    # Remove horizontal/vertical grid lines to prevent misread as 'l' or '-'
+    inv_binary = cv2.bitwise_not(binary)
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+    horiz_lines = cv2.morphologyEx(inv_binary, cv2.MORPH_OPEN, horiz_kernel, iterations=2)
+    binary = cv2.bitwise_or(binary, horiz_lines)
+
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+    vert_lines = cv2.morphologyEx(inv_binary, cv2.MORPH_OPEN, vert_kernel, iterations=2)
+    binary = cv2.bitwise_or(binary, vert_lines)
+
     # Morphological opening with a 2×2 kernel to remove isolated noise pixels
     # without breaking connected character strokes
     kernel_morph = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
@@ -840,6 +976,8 @@ def preprocess_for_easyocr(img, auto_deskew: bool = False):
     (120–180) that uses CLAHE on the L channel for better tonal separation.
     """
     if auto_deskew:
+        img = auto_orient_image(img)
+        img = auto_crop_receipt(img)
         img = deskew_image(img)
 
     open_cv_image = np.array(img)
@@ -1300,6 +1438,11 @@ def parse_type1_web(text):
         "giá tiền": "Giá tiền",
         "gia tien": "Giá tiền",
         "loại vé": "Loại vé",
+        "loai ve": "Loại vé",
+        "t6 vào": "Thời gian vào",
+        "t6 ra": "Thời gian ra",
+        "tg vào": "Thời gian vào",
+        "tg ra": "Thời gian ra"
     }
 
     # Chuỗi các label để phát hiện bằng fuzzy nếu regex không khớp
@@ -1388,10 +1531,10 @@ def parse_type2_vetc(text):
                           r"Transaction[ \t]*[Cc]ode", r"Trans\.?[ \t]*ID"],
         "Trạng thái":    [r"Tr[ạa]ng[ \t]*th[áa]i", r"T[ìi]nh[ \t]*tr[ạa]ng",
                           r"Status", r"Tr[ạa]ng[ \t]*th[àa]i"],
-        # Biển số: bắt cả dạng 'Biến số', 'Bien so', 'Biển số xe', 'BSX'
+        # Biển số: bắt cả dạng 'Biến số', 'Bien so', 'Biển số xe', 'BSX', 'BKS'
         "Biển số":       [
-            r"Bi[eêếềệểễ][nń][ \t]*s[oôốồổỗộ][ \t]*xe?",
-            r"Bi[eê]n[ \t]*so",
+            r"Bi[eêếềệểễ][nń][ \t]*[sS5][oôốồổỗộ][ \t]*xe?",
+            r"Bi[eê]n[ \t]*[sS5]o",
             r"\bBKS\b",
             r"\bBSX\b",
             r"Bi[ểe]n[ \t]*ki[eê]m",
@@ -1401,14 +1544,16 @@ def parse_type2_vetc(text):
         "EPC":           [r"\bEPC\b", r"\bRFID\b", r"M[ãa][ \t]*th[ẻe]",
                           r"EPC[ \t]*[Cc]ode", r"Tag[ \t]*ID"],
         "TG vào":        [r"TG[ \t]*v[àa]o", r"Gi[ờo][ \t]*v[àa]o",
-                          r"Th[ờo]i[ \t]*gian[ \t]*v[àa]o", r"Entry[ \t]*[Tt]ime"],
+                          r"Th[ờo]i[ \t]*gian[ \t]*v[àa]o", r"Entry[ \t]*[Tt]ime",
+                          r"T[6G][ \t]*v[àa]o"],
         # Id trạm vào phải đứng trước Trạm vào để không bị bắt nhầm
         "Id trạm vào":   [r"Id[ \t]*tr[ạa]m[ \t]*v[àa]o", r"Station[ \t]*[Ii]n[ \t]*[Ii][Dd]"],
         "Trạm vào":      [r"Tr[ạa]m[ \t]*v[àa]o", r"Entry[ \t]*[Ss]tation"],
-        "Làn vào":       [r"L[àa]n[ \t]*v[àa]o", r"Lane[ \t]*[Ii]n"],
+        "Làn vào":       [r"L[àa]n[ \t]*v[àa]o", r"Lane[ \t]*[Ii]n", r"L[àa]n[ \t]*[vV]"],
         # TG Ra: chỉ khớp 'TG Ra' chứ KHÔNG khớp 'Id trạm ra'
         "TG ra":         [r"TG[ \t]*[Rr]a\b", r"Gi[ờo][ \t]*[Rr]a\b",
-                          r"Th[ờo]i[ \t]*gian[ \t]*[Rr]a\b", r"Exit[ \t]*[Tt]ime"],
+                          r"Th[ờo]i[ \t]*gian[ \t]*[Rr]a\b", r"Exit[ \t]*[Tt]ime",
+                          r"T[6G][ \t]*[Rr]a\b"],
         "Id trạm ra":    [r"Id[ \t]*tr[ạa]m[ \t]*ra", r"Station[ \t]*[Oo]ut[ \t]*[Ii][Dd]"],
         "Trạm ra":       [r"Tr[ạa]m[ \t]*ra", r"Exit[ \t]*[Ss]tation"],
         # Làn ra: dùng word boundary để không bắt 'Làn vào'
@@ -1546,20 +1691,26 @@ class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent, cfg: dict, on_save):
         super().__init__(parent)
         self.title("⚙️ Settings")
-        self.geometry("600x680")
-        self.resizable(False, False)
+        self.geometry("620x760")
+        self.minsize(580, 700)
+        self.resizable(False, True)   # allow vertical resize if needed
         self.grab_set()           # modal
         self._cfg    = cfg
         self._on_save = on_save
 
-        pad = dict(padx=20, pady=8)
-
+        # ── Title (fixed, above scroll) ──────────────────────────
         ctk.CTkLabel(self, text="Application Settings",
-                     font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(16, 6))
+
+        # ── Scrollable content area ───────────────────────────────
+        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll.pack(fill='both', expand=True, padx=0, pady=0)
+
+        pad = dict(padx=20, pady=5)
 
         # Tesseract path
-        ctk.CTkLabel(self, text="Tesseract Binary Path:", anchor="w").pack(fill='x', **pad)
-        tess_frame = ctk.CTkFrame(self, fg_color="transparent")
+        ctk.CTkLabel(scroll, text="Tesseract Binary Path:", anchor="w").pack(fill='x', **pad)
+        tess_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         tess_frame.pack(fill='x', padx=20, pady=0)
         self._tess_var = ctk.StringVar(value=cfg.get("tesseract_path", ""))
         ctk.CTkEntry(tess_frame, textvariable=self._tess_var).pack(side='left', fill='x', expand=True)
@@ -1567,8 +1718,8 @@ class SettingsDialog(ctk.CTkToplevel):
                       command=self._browse_tesseract).pack(side='left', padx=(6, 0))
 
         # Database path
-        ctk.CTkLabel(self, text="Database File Path:", anchor="w").pack(fill='x', **pad)
-        db_frame = ctk.CTkFrame(self, fg_color="transparent")
+        ctk.CTkLabel(scroll, text="Database File Path:", anchor="w").pack(fill='x', **pad)
+        db_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         db_frame.pack(fill='x', padx=20, pady=0)
         self._db_var = ctk.StringVar(value=cfg.get("db_path", ""))
         ctk.CTkEntry(db_frame, textvariable=self._db_var).pack(side='left', fill='x', expand=True)
@@ -1576,8 +1727,8 @@ class SettingsDialog(ctk.CTkToplevel):
                       command=self._browse_db).pack(side='left', padx=(6, 0))
 
         # Export directory
-        ctk.CTkLabel(self, text="Default Export Directory:", anchor="w").pack(fill='x', **pad)
-        exp_frame = ctk.CTkFrame(self, fg_color="transparent")
+        ctk.CTkLabel(scroll, text="Default Export Directory:", anchor="w").pack(fill='x', **pad)
+        exp_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         exp_frame.pack(fill='x', padx=20, pady=0)
         self._export_var = ctk.StringVar(value=cfg.get("export_directory", str(Path.home())))
         ctk.CTkEntry(exp_frame, textvariable=self._export_var).pack(side='left', fill='x', expand=True)
@@ -1585,26 +1736,26 @@ class SettingsDialog(ctk.CTkToplevel):
                       command=self._browse_export_dir).pack(side='left', padx=(6, 0))
 
         # Theme
-        ctk.CTkLabel(self, text="Appearance Theme:", anchor="w").pack(fill='x', **pad)
+        ctk.CTkLabel(scroll, text="Appearance Theme:", anchor="w").pack(fill='x', **pad)
         self._theme_var = ctk.StringVar(value=cfg.get("theme", "Dark"))
-        ctk.CTkOptionMenu(self, variable=self._theme_var,
+        ctk.CTkOptionMenu(scroll, variable=self._theme_var,
                           values=["Dark", "Light", "System"]).pack(fill='x', padx=20, pady=0)
 
         # Log level
-        ctk.CTkLabel(self, text="Log Level:", anchor="w").pack(fill='x', **pad)
+        ctk.CTkLabel(scroll, text="Log Level:", anchor="w").pack(fill='x', **pad)
         self._log_var = ctk.StringVar(value=cfg.get("log_level", "INFO"))
-        ctk.CTkOptionMenu(self, variable=self._log_var,
+        ctk.CTkOptionMenu(scroll, variable=self._log_var,
                           values=["DEBUG", "INFO", "WARNING", "ERROR"]).pack(fill='x', padx=20, pady=0)
 
-        # OCR mode (v3.0.1)
-        ctk.CTkLabel(self, text="OCR Mode:", anchor="w").pack(fill='x', **pad)
+        # OCR mode
+        ctk.CTkLabel(scroll, text="OCR Mode:", anchor="w").pack(fill='x', **pad)
         self._ocr_mode_var = ctk.StringVar(value=cfg.get("ocr_mode", "dual"))
-        ctk.CTkOptionMenu(self, variable=self._ocr_mode_var,
+        ctk.CTkOptionMenu(scroll, variable=self._ocr_mode_var,
                           values=["dual", "tesseract_only", "easyocr_only"]
                           ).pack(fill='x', padx=20, pady=0)
 
-        # EasyOCR confidence threshold (v3.0.1)
-        conf_frame = ctk.CTkFrame(self, fg_color="transparent")
+        # EasyOCR confidence threshold
+        conf_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         conf_frame.pack(fill='x', padx=20, pady=(8, 0))
         ctk.CTkLabel(conf_frame, text="EasyOCR Confidence Threshold:",
                      anchor="w").pack(side='left')
@@ -1616,30 +1767,38 @@ class SettingsDialog(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=10), text_color="gray60"
                      ).pack(side='left', padx=(4, 0))
 
+        # ── Separator ──
+        ctk.CTkFrame(scroll, height=1, fg_color="#334155").pack(fill='x', padx=20, pady=(12, 4))
+        ctk.CTkLabel(scroll, text="Behaviour Options",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#64748B", anchor="w").pack(fill='x', padx=20)
+
         # Toggles
         self._auto_var = ctk.BooleanVar(value=cfg.get("auto_scan_on_load", False))
-        ctk.CTkCheckBox(self, text="Auto-scan first image when loading directory",
-                        variable=self._auto_var).pack(anchor='w', padx=20, pady=(12, 4))
+        ctk.CTkCheckBox(scroll, text="Auto-scan first image when loading directory",
+                        variable=self._auto_var).pack(anchor='w', padx=20, pady=(8, 3))
 
         self._deskew_var = ctk.BooleanVar(value=cfg.get("auto_deskew", False))
-        ctk.CTkCheckBox(self, text="Auto-deskew images before OCR (corrects text angle)",
-                        variable=self._deskew_var).pack(anchor='w', padx=20, pady=4)
+        ctk.CTkCheckBox(scroll, text="Auto-deskew images before OCR",
+                        variable=self._deskew_var).pack(anchor='w', padx=20, pady=3)
 
         self._thumb_var = ctk.BooleanVar(value=cfg.get("show_thumbnails", True))
-        ctk.CTkCheckBox(self, text="Show image thumbnails in file list",
-                        variable=self._thumb_var).pack(anchor='w', padx=20, pady=4)
+        ctk.CTkCheckBox(scroll, text="Show image thumbnails in file list",
+                        variable=self._thumb_var).pack(anchor='w', padx=20, pady=3)
 
-        # v3.0.2: auto-copy JSON to clipboard after each scan
         self._auto_copy_json_var = ctk.BooleanVar(value=cfg.get("auto_copy_json", False))
-        ctk.CTkCheckBox(
-            self,
-            text="Auto-copy JSON to clipboard after scan",
-            variable=self._auto_copy_json_var,
-        ).pack(anchor='w', padx=20, pady=4)
+        ctk.CTkCheckBox(scroll, text="Auto-copy JSON to clipboard after scan",
+                        variable=self._auto_copy_json_var).pack(anchor='w', padx=20, pady=3)
 
-        # Buttons
+        # v4.0.1
+        self._auto_nav_var = ctk.BooleanVar(value=cfg.get("auto_scan_on_navigate", False))
+        ctk.CTkCheckBox(scroll,
+                        text="Auto-scan when navigating Prev/Next  ✦ v4.0.1",
+                        variable=self._auto_nav_var).pack(anchor='w', padx=20, pady=(3, 12))
+
+        # ── Save / Cancel buttons (fixed at bottom, outside scroll) ──
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill='x', padx=20, pady=(14, 20))
+        btn_frame.pack(fill='x', padx=20, pady=(8, 16), side='bottom')
         ctk.CTkButton(btn_frame, text="💾 Save", fg_color="#10B981", hover_color="#059669",
                       command=self._save).pack(side='left', expand=True, fill='x', padx=(0, 5))
         ctk.CTkButton(btn_frame, text="✖ Cancel", fg_color="#6B7280", hover_color="#4B5563",
@@ -1668,16 +1827,17 @@ class SettingsDialog(ctk.CTkToplevel):
             self._export_var.set(path)
 
     def _save(self):
-        self._cfg["tesseract_path"]    = self._tess_var.get().strip()
-        self._cfg["db_path"]           = self._db_var.get().strip()
-        self._cfg["export_directory"]  = self._export_var.get().strip()
-        self._cfg["theme"]             = self._theme_var.get()
-        self._cfg["log_level"]         = self._log_var.get()
-        self._cfg["ocr_mode"]          = self._ocr_mode_var.get()
-        self._cfg["auto_scan_on_load"] = self._auto_var.get()
-        self._cfg["auto_deskew"]       = self._deskew_var.get()
-        self._cfg["show_thumbnails"]   = self._thumb_var.get()
-        self._cfg["auto_copy_json"]    = self._auto_copy_json_var.get()  # v3.0.2
+        self._cfg["tesseract_path"]         = self._tess_var.get().strip()
+        self._cfg["db_path"]                = self._db_var.get().strip()
+        self._cfg["export_directory"]       = self._export_var.get().strip()
+        self._cfg["theme"]                  = self._theme_var.get()
+        self._cfg["log_level"]              = self._log_var.get()
+        self._cfg["ocr_mode"]               = self._ocr_mode_var.get()
+        self._cfg["auto_scan_on_load"]      = self._auto_var.get()
+        self._cfg["auto_deskew"]            = self._deskew_var.get()
+        self._cfg["show_thumbnails"]        = self._thumb_var.get()
+        self._cfg["auto_copy_json"]         = self._auto_copy_json_var.get()
+        self._cfg["auto_scan_on_navigate"]  = self._auto_nav_var.get()   # v4.0.1
         try:
             threshold = float(self._conf_var.get())
             self._cfg["ocr_confidence_threshold"] = max(0.0, min(1.0, threshold))
@@ -1723,18 +1883,26 @@ class HistoryDialog(ctk.CTkToplevel):
         ctk.CTkButton(top, text="🗑 Delete", width=80,
                       fg_color="#991B1B", hover_color="#7F1D1D",
                       command=self._delete_selected).pack(side='left', padx=6)
-        ctk.CTkButton(top, text="📊 Export Filtered CSV", fg_color="#1D4ED8",
+        export_frame = ctk.CTkFrame(self, fg_color="transparent")
+        export_frame.pack(fill='x', padx=15, pady=(0, 10))
+        
+        ctk.CTkButton(export_frame, text="📊 Export Filtered CSV", fg_color="#1D4ED8",
                       hover_color="#1E40AF",
                       command=self._export_filtered_csv).pack(side='left', padx=6)
-        # v3.0.2 — JSON exports
-        ctk.CTkButton(top, text="📄 Export Filtered JSON", fg_color="#0F766E",
+        ctk.CTkButton(export_frame, text="📄 Export Filtered JSON", fg_color="#0F766E",
                       hover_color="#0D9488",
                       command=self._export_filtered_json).pack(side='left', padx=6)
-        ctk.CTkButton(top, text="📄 Export All JSON", fg_color="#7C3AED",
+        ctk.CTkButton(export_frame, text="📗 Export Filtered Excel", fg_color="#047857",
+                      hover_color="#065F46",
+                      command=self._export_filtered_xlsx).pack(side='left', padx=6)
+                      
+        ctk.CTkButton(export_frame, text="📊 Export All CSV", fg_color="#B91C1C",
+                      hover_color="#991B1B", command=self._export_all_csv).pack(side='right', padx=6)
+        ctk.CTkButton(export_frame, text="📄 Export All JSON", fg_color="#7C3AED",
                       hover_color="#6D28D9",
-                      command=self._export_all_json).pack(side='left', padx=6)
-        ctk.CTkButton(top, text="📊 Export All CSV", fg_color="#B91C1C",
-                      hover_color="#991B1B", command=self._export_all_csv).pack(side='right')
+                      command=self._export_all_json).pack(side='right', padx=6)
+        ctk.CTkButton(export_frame, text="📗 Export All Excel", fg_color="#047857",
+                      hover_color="#065F46", command=self._export_all_xlsx).pack(side='right', padx=6)
 
         # Row count label
         self._count_label = ctk.CTkLabel(top, text="", font=ctk.CTkFont(size=11),
@@ -1933,6 +2101,60 @@ class HistoryDialog(ctk.CTkToplevel):
                 parent=self,
             )
 
+    def _export_filtered_xlsx(self):
+        ts     = datetime.now().strftime('%Y%m%d_%H%M%S')
+        search = self._search_var.get().strip()
+        initial = (f"history_filtered_{ts}.xlsx"
+                   if search else f"history_export_{ts}.xlsx")
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=initial,
+            initialdir=_config.get("export_directory", str(Path.home())),
+            filetypes=[("Excel files", "*.xlsx")],
+            title="Export Filtered History as Excel",
+        )
+        if not path:
+            return
+        limit = _config.get("history_limit", 500)
+        count = self._db.export_filtered_xlsx(path, search=search, limit=limit)
+        if count > 0:
+            messagebox.showinfo(
+                "Excel Export",
+                f"✅ Exported {count} record{'s' if count != 1 else ''} to:\n{path}",
+                parent=self,
+            )
+        else:
+            messagebox.showwarning(
+                "Excel Export",
+                "No records matched the current filter — nothing exported.",
+                parent=self,
+            )
+
+    def _export_all_xlsx(self):
+        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=f"history_all_{ts}.xlsx",
+            initialdir=_config.get("export_directory", str(Path.home())),
+            filetypes=[("Excel files", "*.xlsx")],
+            title="Export Full History as Excel",
+        )
+        if not path:
+            return
+        count = self._db.export_all_xlsx(path)
+        if count > 0:
+            messagebox.showinfo(
+                "Excel Export",
+                f"✅ Exported {count} record{'s' if count != 1 else ''} to:\n{path}",
+                parent=self,
+            )
+        else:
+            messagebox.showwarning(
+                "Excel Export",
+                "The database is empty — nothing to export.",
+                parent=self,
+            )
+
 
 # ─────────────────────────────────────────────────────────────────
 # Shortcuts Help Dialog
@@ -1944,9 +2166,11 @@ class ShortcutsDialog(ctk.CTkToplevel):
     _SHORTCUTS = [
         ("Ctrl + O",       "Load directory"),
         ("Ctrl + S",       "Scan current image"),
-        ("Ctrl + V",       "Paste image from clipboard"),   # v3.0.2
+        ("Ctrl + V",       "Paste image from clipboard"),
+        ("Ctrl + B",       "Start batch scan  ✦ v4.0.1"),
         ("Ctrl + E",       "Export to CSV"),
         ("Ctrl + H",       "Open scan history"),
+        ("Ctrl + I",       "Show image info  ✦ v4.0.1"),
         ("Ctrl + ?",       "Show this shortcuts dialog"),
         ("← / →",          "Previous / Next image"),
         ("↑ / ↓",          "Previous / Next image (alternative)"),
@@ -1957,7 +2181,7 @@ class ShortcutsDialog(ctk.CTkToplevel):
         ("B",              "Toggle OCR bounding boxes"),
         ("+ / =",          "Zoom in"),
         ("- / _",          "Zoom out"),
-        ("0",              "Reset zoom to 100%"),
+        ("0 / Ctrl+Z",     "Reset zoom to 100%  ✦ v4.0.1"),
         ("Delete",         "Remove current image from list"),
     ]
 
@@ -2034,22 +2258,20 @@ class StatisticsDialog(ctk.CTkToplevel):
         lines.append(f"  Today:            {today.get('today', 0)}")
         avg = stats.get("avg_processing_ms", 0)
         lines.append(f"  Avg process time: {avg:.0f} ms")
+        # v4.0.1 — week activity mini-chart
+        week = today.get("week_by_day", {})
+        if week:
+            max_cnt = max(week.values()) or 1
+            lines.append(f"{'─' * 34}")
+            lines.append("  Activity (last 7 days):")
+            for day, cnt in sorted(week.items()):
+                bar_len = max(1, int(cnt / max_cnt * 16))
+                bar = "█" * bar_len + "░" * (16 - bar_len)
+                lines.append(f"  {day[-5:]}  {bar}  {cnt}")
         lines.append(f"{'─' * 34}")
         lines.append("  By receipt type:")
         for rtype, cnt in (stats.get("by_type") or {}).items():
             lines.append(f"    {rtype:<22} {cnt}")
-        lines.append(f"{'─' * 34}")
-        lines.append("  Last 7 days:")
-        week = today.get("week_by_day", {})
-        if week:
-            max_cnt = max(week.values()) if week else 1
-            bar_scale = 28 / max(max_cnt, 1)   # proportional to max, width 28
-            for day, cnt in sorted(week.items()):
-                bar_len = max(1, int(cnt * bar_scale)) if cnt else 0
-                bar = "█" * bar_len
-                lines.append(f"    {day}  {bar} {cnt}")
-        else:
-            lines.append("    (no data)")
         lines.append(f"{'─' * 34}")
 
         self._text.configure(state="normal")
@@ -2241,6 +2463,12 @@ class NextLevelOCRScanner(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"))
         self._img_name_label.pack(side='left')
 
+        # v4.0.1: Image info label (W×H, size, format)
+        self._img_info_label = ctk.CTkLabel(
+            tb, text="",
+            font=ctk.CTkFont(size=10), text_color="#64748B")
+        self._img_info_label.pack(side='left', padx=(8, 0))
+
         # Right side: zoom controls
         ctk.CTkButton(tb, text="🔍+", width=36,
                       command=lambda: self._zoom(1.2)).pack(side='right', padx=2)
@@ -2347,7 +2575,8 @@ class NextLevelOCRScanner(ctk.CTk):
 
         # ── Structured Data tab ────────────────────────────────
         sd_tab = self.tabview.tab("Structured Data")
-        sd_tab.grid_rowconfigure(0, weight=1)
+        sd_tab.grid_rowconfigure(0, weight=1)   # textbox expands
+        sd_tab.grid_rowconfigure(1, weight=0)   # v4.0.1: quick-copy panel (fixed height)
         sd_tab.grid_columnconfigure(0, weight=1)
         self.smart_data_box = ctk.CTkTextbox(
             sd_tab, fg_color="#0F111A", text_color="#00FFAA",
@@ -2411,7 +2640,7 @@ class NextLevelOCRScanner(ctk.CTk):
         # Action buttons row 1
         af1 = ctk.CTkFrame(self.results_frame, fg_color="transparent")
         af1.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 0))
-        af1.grid_columnconfigure((0, 1, 2), weight=1)
+        af1.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         self.btn_copy = ctk.CTkButton(
             af1, text="📄 Copy JSON",
@@ -2429,7 +2658,14 @@ class NextLevelOCRScanner(ctk.CTk):
             af1, text="🗂 JSON",
             fg_color="#7C3AED", hover_color="#6D28D9",
             command=self.export_to_json)
-        self.btn_export_json.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+        self.btn_export_json.grid(row=0, column=2, sticky="ew", padx=3)
+
+        # v4.0.1: XLSX export for current scan
+        self.btn_export_xlsx = ctk.CTkButton(
+            af1, text="📗 XLSX",
+            fg_color="#065F46", hover_color="#047857",
+            command=self.export_to_xlsx)
+        self.btn_export_xlsx.grid(row=0, column=3, sticky="ew", padx=(3, 0))
 
         # Action buttons row 2 (v3.0.1)
         af2 = ctk.CTkFrame(self.results_frame, fg_color="transparent")
@@ -2466,7 +2702,27 @@ class NextLevelOCRScanner(ctk.CTk):
         self._today_label = ctk.CTkLabel(
             self._status_bar, text="",
             font=ctk.CTkFont(size=11), text_color="#4ADE80", anchor="e")
-        self._today_label.pack(side='right', padx=8)
+        self._today_label.pack(side='right', padx=12)
+        
+        # Theme Toggle
+        def toggle_theme():
+            new_mode = "Light" if ctk.get_appearance_mode() == "Dark" else "Dark"
+            ctk.set_appearance_mode(new_mode)
+            _config["theme"] = new_mode
+            save_config(_config)
+            self._theme_switch.configure(text=f"{new_mode} Mode")
+
+        current_mode = ctk.get_appearance_mode()
+        self._theme_switch = ctk.CTkSwitch(
+            self._status_bar, text=f"{current_mode} Mode", command=toggle_theme,
+            font=ctk.CTkFont(size=11), switch_width=32, switch_height=16
+        )
+        if current_mode == "Dark":
+            self._theme_switch.select()
+        else:
+            self._theme_switch.deselect()
+        self._theme_switch.pack(side='right', padx=8)
+
         self._tick_clock()
         self._refresh_today_label()
 
@@ -2483,6 +2739,13 @@ class NextLevelOCRScanner(ctk.CTk):
         # v3.0.2: paste clipboard image
         self.bind("<Control-v>", lambda e: self.paste_image_from_clipboard())
         self.bind("<Control-V>", lambda e: self.paste_image_from_clipboard())
+        # v4.0.1 new shortcuts
+        self.bind("<Control-b>", lambda e: self.start_batch_scan())
+        self.bind("<Control-B>", lambda e: self.start_batch_scan())
+        self.bind("<Control-z>", lambda e: self._zoom_reset())
+        self.bind("<Control-Z>", lambda e: self._zoom_reset())
+        self.bind("<Control-i>", lambda e: self._show_image_info())
+        self.bind("<Control-I>", lambda e: self._show_image_info())
 
         # Image navigation
         self.bind("<Left>",  lambda e: self._navigate(-1))
@@ -2501,11 +2764,11 @@ class NextLevelOCRScanner(ctk.CTk):
         self.bind("<B>",     lambda e: self._toggle_boxes())
 
         # Zoom
-        self.bind("<plus>",      lambda e: self._zoom(1.2))
-        self.bind("<equal>",     lambda e: self._zoom(1.2))
-        self.bind("<minus>",     lambda e: self._zoom(1 / 1.2))
+        self.bind("<plus>",       lambda e: self._zoom(1.2))
+        self.bind("<equal>",      lambda e: self._zoom(1.2))
+        self.bind("<minus>",      lambda e: self._zoom(1 / 1.2))
         self.bind("<underscore>", lambda e: self._zoom(1 / 1.2))
-        self.bind("<0>",         lambda e: self._zoom_reset())
+        self.bind("<0>",          lambda e: self._zoom_reset())
 
         # Delete from list
         self.bind("<Delete>",  lambda e: self._remove_current_from_list())
@@ -2530,19 +2793,30 @@ class NextLevelOCRScanner(ctk.CTk):
 
     def _show_toast(self, msg: str, color: str = "#1E293B",
                     text_color: str = "#00FFAA", duration_ms: int = 2500):
-        """Display a brief floating toast notification near the bottom of the window."""
+        """Display a brief floating toast with fade-in animation (v4.0.1)."""
         try:
             tw = tk.Toplevel(self)
             tw.wm_overrideredirect(True)
-            # Position at bottom-centre of main window
+            tw.attributes("-alpha", 0.0)   # start transparent for fade-in
+            # Position at bottom-centre of main window, clamped to screen
             rx = self.winfo_rootx() + self.winfo_width() // 2
-            ry = self.winfo_rooty() + self.winfo_height() - 70
-            tw.wm_geometry(f"+{rx - 150}+{ry}")
+            ry = self.winfo_rooty() + max(100, self.winfo_height() - 80)
+            tw.wm_geometry(f"+{rx - 180}+{ry}")
             lbl = tk.Label(tw, text=msg, justify="center",
                            background=color, foreground=text_color,
                            font=("Segoe UI", 11), relief="flat",
                            padx=18, pady=8, bd=1)
             lbl.pack()
+            # Fade-in: increase alpha in steps over 200 ms
+            def _fade_in(step=0):
+                alpha = min(1.0, step * 0.1)
+                try:
+                    tw.attributes("-alpha", alpha)
+                except Exception:
+                    return
+                if alpha < 1.0:
+                    tw.after(20, _fade_in, step + 1)
+            _fade_in()
             tw.after(duration_ms, tw.destroy)
         except Exception:
             pass
@@ -2651,8 +2925,8 @@ class NextLevelOCRScanner(ctk.CTk):
             def _load_thumb(p=path, lbl=thumb_label):
                 try:
                     img = Image.open(p)
-                    img.thumbnail((_THUMB_W, _THUMB_H))
-                    tk_img = ImageTk.PhotoImage(img)
+                    # Using CTkImage prevents HighDPI blurring and scales properly
+                    tk_img = ctk.CTkImage(light_image=img, size=(_THUMB_W, _THUMB_H))
                     self._thumb_refs[p] = tk_img
                     lbl.after(0, lambda i=tk_img: lbl.configure(image=i, text=""))
                 except Exception:
@@ -2686,6 +2960,16 @@ class NextLevelOCRScanner(ctk.CTk):
             total = len(self.image_files)
             self._img_name_label.configure(
                 text=f"[{idx}/{total}]  {os.path.basename(path)}")
+            # v4.0.1: update image info label
+            try:
+                iw, ih = self._base_pil_img.size
+                fmt    = self._base_pil_img.format or os.path.splitext(path)[1].upper().lstrip('.')
+                fsize  = os.path.getsize(path)
+                fsize_str = f"{fsize / 1024:.0f} KB" if fsize < 1_048_576 else f"{fsize / 1_048_576:.1f} MB"
+                self._img_info_label.configure(
+                    text=f"{iw}×{ih} px  {fmt}  {fsize_str}")
+            except Exception:
+                self._img_info_label.configure(text="")
             self.update_textbox(self.smart_data_box,
                                 "--- Ready ---\nPress START SCAN or Ctrl+S.")
             self.update_textbox(self.raw_data_box, "Image loaded. Ready for OCR.")
@@ -2824,6 +3108,9 @@ class NextLevelOCRScanner(ctk.CTk):
         new_idx = idx + direction
         if 0 <= new_idx < len(self.image_files):
             self.display_image(self.image_files[new_idx])
+            # v4.0.1: auto-scan on navigate if option enabled
+            if _config.get("auto_scan_on_navigate", False):
+                self.after(50, self.start_scan_thread)
 
     def _update_nav_buttons(self):
         """Enable/disable Prev/Next buttons based on current position."""
@@ -3329,10 +3616,21 @@ class NextLevelOCRScanner(ctk.CTk):
             "type2_vetc":  "📱 Type 2 — VETC App (key:value)",
         }.get(receipt_type, "❓ Unknown")
 
+        # v4.0.1: colorized confidence bar
         conf_bar = ""
         if metadata and easy_conf > 0:
             filled = int(easy_conf * 20)
-            conf_bar = f"\n🎯 Conf: [{'█' * filled}{'░' * (20 - filled)}] {easy_conf * 100:.1f}%"
+            hi  = _config.get("conf_color_hi", 0.80)
+            lo  = _config.get("conf_color_lo", 0.60)
+            if easy_conf >= hi:
+                conf_icon = "🟢"
+            elif easy_conf >= lo:
+                conf_icon = "🟡"
+            else:
+                conf_icon = "🔴"
+            conf_bar = (f"\n{conf_icon} Conf: ["
+                        f"{'█' * filled}{'░' * (20 - filled)}"
+                        f"] {easy_conf * 100:.1f}%")
 
         smart = (f"🔬 Engine:  {engine_label}\n"
                  f"📋 Type:    {type_label}\n"
@@ -3410,12 +3708,74 @@ class NextLevelOCRScanner(ctk.CTk):
             except Exception as _exc:
                 logger.warning("Auto-copy JSON failed: %s", _exc)
 
+        # v4.0.1 — Inject quick-field copy buttons into the smart data box
+        if metadata:
+            self._inject_field_copy_buttons(metadata)
+
         # Show success toast only when scan actually produced fields
         if fields_n > 0:
             self._show_toast(f"✅ {fields_n} fields extracted in {elapsed_ms} ms",
                              color="#0F2027", text_color="#34D399")
         logger.info("Single scan done: %dms, fields=%d",
                     elapsed_ms, len(metadata) if metadata else 0)
+
+    def _inject_field_copy_buttons(self, metadata: dict):
+        """Overlay a compact grid of quick-copy buttons below the smart data box.
+
+        v4.0.1 — Each button shows the field name and copies its value to the
+        clipboard with a single click.  The widget is destroyed and recreated on
+        every scan so stale data never lingers.
+        """
+        # Destroy previous quick-copy frame if it exists
+        prev = getattr(self, "_quick_copy_frame", None)
+        if prev:
+            try:
+                prev.destroy()
+            except Exception:
+                pass
+
+        sd_tab = self.tabview.tab("Structured Data")
+        frame = ctk.CTkScrollableFrame(
+            sd_tab, fg_color="#0D1B2A", corner_radius=6, height=100)
+        frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
+        frame.grid_columnconfigure(tuple(range(3)), weight=1)
+        self._quick_copy_frame = frame
+
+        # Label header
+        ctk.CTkLabel(
+            frame, text="⚡ Quick Copy",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#475569"
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 2))
+
+        FIELD_ICONS = {
+            "Mã giao dịch": "🔢", "Biển số": "🚗", "EPC": "📡",
+            "Giá tiền": "💰", "Trạng thái": "✅", "TG vào": "⏰",
+            "TG ra": "⏰", "Thời gian vào": "⏰", "Thời gian ra": "⏰",
+            "Trạm vào": "🏁", "Trạm ra": "🏁", "Làn vào": "🛣",
+            "Làn ra": "🛣", "Loại vé": "🎫", "Đơn vị": "🏢",
+        }
+        col_colors = [
+            ("#1E3A5F", "#2563EB"), ("#1F2D1A", "#16A34A"),
+            ("#2D1433", "#9333EA"),
+        ]
+        for i, (field, value) in enumerate(metadata.items()):
+            row_i   = i // 3 + 1
+            col_i   = i % 3
+            bg, hov = col_colors[col_i % len(col_colors)]
+            icon    = FIELD_ICONS.get(field, "📋")
+            # Truncate value for button label
+            val_short = value[:18] + "…" if len(value) > 18 else value
+            full_text = f"{icon} {field}\n{val_short}"
+            ctk.CTkButton(
+                frame,
+                text=full_text,
+                font=ctk.CTkFont(size=9),
+                fg_color=bg, hover_color=hov,
+                text_color="#CBD5E1",
+                corner_radius=4, height=36,
+                command=lambda f=field, v=value: self._copy_field_value(f, v),
+            ).grid(row=row_i, column=col_i, sticky="ew", padx=3, pady=2)
 
     # ──────────────────────────────────────────────────────────
     # Batch Scan
@@ -3651,6 +4011,95 @@ class NextLevelOCRScanner(ctk.CTk):
     def _flash_button(self, btn, temp_text: str, orig_text: str, delay: int = 2000):
         btn.configure(text=temp_text)
         self.after(delay, lambda: btn.configure(text=orig_text))
+
+    # ──────────────────────────────────────────────────────────
+    # v4.0.1 — Image Info & quick-field copy
+    # ──────────────────────────────────────────────────────────
+
+    def _show_image_info(self):
+        """Show detailed image information in a toast + status bar (Ctrl+I)."""
+        if self._base_pil_img is None:
+            self.set_status("⚠️  No image loaded.")
+            return
+        try:
+            path = self.current_image_path
+            iw, ih = self._base_pil_img.size
+            fmt   = self._base_pil_img.format or os.path.splitext(path)[1].upper().lstrip('.')
+            fsize = os.path.getsize(path)
+            fsize_str = f"{fsize / 1024:.0f} KB" if fsize < 1_048_576 else f"{fsize / 1_048_576:.1f} MB"
+            mode  = self._base_pil_img.mode
+            info  = f"📸 {os.path.basename(path)}\n{iw}×{ih} px | {mode} | {fmt} | {fsize_str}"
+            self._show_toast(info, color="#0F172A", text_color="#38BDF8", duration_ms=3500)
+            self.set_status(f"🖼 {iw}×{ih} px | {mode} | {fmt} | {fsize_str}")
+        except Exception as exc:
+            self.set_status(f"Image info error: {exc}")
+
+    def _copy_field_value(self, field: str, value: str):
+        """Copy a single field value to clipboard and show a toast (v4.0.1)."""
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(value)
+            self._show_toast(f"📋 Copied  {field}: {value[:40]}",
+                             color="#0F2027", text_color="#34D399", duration_ms=1800)
+            self.set_status(f"Copied: {field} = {value}")
+        except Exception as exc:
+            logger.warning("Field copy failed: %s", exc)
+
+    # ──────────────────────────────────────────────────────────
+    # v4.0.1 — Export current scan to XLSX
+    # ──────────────────────────────────────────────────────────
+
+    def export_to_xlsx(self):
+        """Export the current scan's metadata to a single-row XLSX file."""
+        if not self.latest_metadata:
+            self._flash_button(self.btn_export_xlsx, "⚠️ No Data", "📗 XLSX")
+            return
+        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=f"receipt_{ts}.xlsx",
+            initialdir=_config.get("export_directory", str(Path.home())),
+            filetypes=[("Excel files", "*.xlsx")]
+        )
+        if not path:
+            return
+        try:
+            from openpyxl.utils import get_column_letter
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Receipt"
+            # Header row with color
+            from openpyxl.styles import PatternFill, Font, Alignment
+            header_fill = PatternFill("solid", fgColor="1E293B")
+            header_font = Font(bold=True, color="00FFAA")
+            keys = list(self.latest_metadata.keys())
+            for ci, key in enumerate(keys, start=1):
+                cell = ws.cell(row=1, column=ci, value=key)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center")
+            # Data row
+            for ci, key in enumerate(keys, start=1):
+                ws.cell(row=2, column=ci, value=self.latest_metadata[key])
+            # Metadata rows
+            ws.cell(row=4, column=1, value="Exported at")
+            ws.cell(row=4, column=2, value=datetime.now().isoformat())
+            ws.cell(row=5, column=1, value="App version")
+            ws.cell(row=5, column=2, value=APP_VERSION)
+            ws.cell(row=6, column=1, value="Receipt type")
+            ws.cell(row=6, column=2, value=self.latest_receipt_type)
+            ws.cell(row=7, column=1, value="Source image")
+            ws.cell(row=7, column=2, value=self.current_image_path)
+            # Column widths
+            for col in range(1, len(keys) + 1):
+                ws.column_dimensions[get_column_letter(col)].width = 22
+            wb.save(path)
+            self._flash_button(self.btn_export_xlsx, "✅ Saved!", "📗 XLSX")
+            self.set_status(f"XLSX exported: {path}")
+            logger.info("Single-scan XLSX exported: %s", path)
+        except Exception as exc:
+            logger.error("XLSX export error: %s", exc)
+            messagebox.showerror("Export Error", f"Failed:\n{exc}")
 
     # ──────────────────────────────────────────────────────────
     # Dialogs
@@ -3931,4 +4380,3 @@ if __name__ == "__main__":
     _db.init_schema()
     app = NextLevelOCRScanner()
     app.mainloop()
-
