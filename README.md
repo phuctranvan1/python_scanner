@@ -4,7 +4,7 @@
 
 **Enterprise-grade OCR tool for extracting structured data from Vietnamese ETC toll receipts**
 
-[![Version](https://img.shields.io/badge/version-3.0.1-brightgreen)](#)
+[![Version](https://img.shields.io/badge/version-3.0.2-brightgreen)](#)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](#)
 
@@ -143,6 +143,13 @@ The application auto-detects the receipt type and falls back to the alternate pa
 ---
 
 ## Changelog
+
+### v3.0.2
+- **Paste image from clipboard** — `Ctrl+V` shortcut + sidebar "📋 Paste" button; saves clipboard image to a temp file and loads it directly into the scanner (Windows/macOS)
+- **Recent directories quick access** — "📂 Recent" sidebar button opens a dialog listing the last 10 opened directories with one-click load; entries are persisted in config
+- **Duplicate scan detection** — after a successful scan the transaction code is checked against the database; a prominent amber toast warning is shown if the same code has already been stored
+- **History JSON export** — "📄 Export Filtered JSON" and "📄 Export All JSON" buttons added to the History dialog (complement to existing CSV exports)
+- **Auto-copy JSON on scan** — new Settings checkbox: automatically copies the extracted JSON to the clipboard after every successful scan
 
 ### v3.0.1
 - Added PSM 4 (single-column) as a third Tesseract candidate

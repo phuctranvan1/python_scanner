@@ -24,6 +24,12 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageEnhance, ImageFilter, ImageOps  # type: ignore
 
 try:
+    from PIL import ImageGrab  # type: ignore  # not available on all platforms / display servers
+    _IMAGEGRAB_AVAILABLE = True
+except Exception:
+    _IMAGEGRAB_AVAILABLE = False
+
+try:
     import pytesseract  # type: ignore
     import customtkinter as ctk  # type: ignore
 except ImportError:
@@ -41,7 +47,7 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.0.2"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
 
 # Supported image file extensions
@@ -61,6 +67,13 @@ _THUMB_H = 46
 
 # Maximum recent files remembered
 _RECENT_FILES_MAX = 10
+
+# v3.0.2 clipboard temp directory (relative name; always inside the OS temp dir)
+_CLIPBOARD_TEMP_DIR = "vetc_clipboard"
+
+# v3.0.2 delay (ms) before showing the duplicate-transaction-code toast, to let
+# the primary "success" toast appear first.
+_DUPLICATE_TOAST_DELAY_MS = 800
 
 # Preprocessing brightness thresholds
 _BRIGHT_THRESHOLD      = 180   # above → "light screenshot" path
@@ -124,6 +137,9 @@ _DEFAULT_CONFIG: dict = {
     "ocr_confidence_threshold": 0.60,   # min EasyOCR confidence to prefer its output
     "history_limit":          500,      # max rows shown in the History dialog
     "batch_preview_interval": 5,        # update preview every N images during batch
+    # v3.0.2 additions
+    "recent_dirs":            [],       # recently opened directories (max 10)
+    "auto_copy_on_scan":      False,    # auto-copy extracted JSON to clipboard after scan
 }
 
 
@@ -504,8 +520,88 @@ class DatabaseManager:
             finally:
                 conn.close()
 
+    def check_duplicate(self, transaction_code: str) -> int:
+        """Return the count of existing scans with the given transaction code.
 
-# Singleton DB manager (path resolved after config is loaded)
+        v3.0.2: Used by the scan pipeline to warn the user when the same receipt
+        has already been stored, preventing accidental duplicate entries.
+        """
+        if not transaction_code or not transaction_code.strip():
+            return 0
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM scans WHERE transaction_code = ?",
+                    (transaction_code.strip(),),
+                )
+                return cur.fetchone()["cnt"]
+            except Exception as exc:
+                logger.error("DB duplicate check error: %s", exc)
+                return 0
+            finally:
+                conn.close()
+
+    def export_all_json(self, file_path: str) -> int:
+        """Dump all rows to a JSON file.  Returns number of rows written.
+
+        v3.0.2: JSON complement to the existing :meth:`export_all_csv`.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM scans ORDER BY id")
+                rows = [dict(r) for r in cur.fetchall()]
+                if not rows:
+                    return 0
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(rows, f, ensure_ascii=False, indent=2, default=str)
+                logger.info("Exported %d rows to JSON: %s", len(rows), file_path)
+                return len(rows)
+            except Exception as exc:
+                logger.error("JSON export error: %s", exc)
+                return 0
+            finally:
+                conn.close()
+
+    def export_filtered_json(self, file_path: str, search: str = "",
+                              limit: int = 5000) -> int:
+        """Dump rows matching *search* to a JSON file.  Returns number of rows written.
+
+        v3.0.2: JSON complement to the existing :meth:`export_filtered_csv`.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                if search:
+                    escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    q = f'%{escaped}%'
+                    cur.execute('''
+                        SELECT * FROM scans
+                        WHERE transaction_code LIKE ? ESCAPE '\\'
+                           OR license_plate LIKE ? ESCAPE '\\'
+                           OR raw_text LIKE ? ESCAPE '\\'
+                        ORDER BY id DESC LIMIT ?
+                    ''', (q, q, q, limit))
+                else:
+                    cur.execute("SELECT * FROM scans ORDER BY id DESC LIMIT ?", (limit,))
+                rows = [dict(r) for r in cur.fetchall()]
+                if not rows:
+                    return 0
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(rows, f, ensure_ascii=False, indent=2, default=str)
+                logger.info("Filtered JSON export: %d rows → %s", len(rows), file_path)
+                return len(rows)
+            except Exception as exc:
+                logger.error("Filtered JSON export error: %s", exc)
+                return 0
+            finally:
+                conn.close()
+
+
 _db = DatabaseManager(_config["db_path"])
 
 # ─────────────────────────────────────────────────────────────────
@@ -1488,6 +1584,10 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkCheckBox(self, text="Show image thumbnails in file list",
                         variable=self._thumb_var).pack(anchor='w', padx=20, pady=4)
 
+        self._auto_copy_var = ctk.BooleanVar(value=cfg.get("auto_copy_on_scan", False))
+        ctk.CTkCheckBox(self, text="Auto-copy extracted JSON to clipboard after each scan",
+                        variable=self._auto_copy_var).pack(anchor='w', padx=20, pady=4)
+
         # Buttons
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill='x', padx=20, pady=(14, 20))
@@ -1528,6 +1628,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._cfg["auto_scan_on_load"] = self._auto_var.get()
         self._cfg["auto_deskew"]       = self._deskew_var.get()
         self._cfg["show_thumbnails"]   = self._thumb_var.get()
+        self._cfg["auto_copy_on_scan"] = self._auto_copy_var.get()
         try:
             threshold = float(self._conf_var.get())
             self._cfg["ocr_confidence_threshold"] = max(0.0, min(1.0, threshold))
@@ -1576,8 +1677,13 @@ class HistoryDialog(ctk.CTkToplevel):
         ctk.CTkButton(top, text="📊 Export Filtered CSV", fg_color="#1D4ED8",
                       hover_color="#1E40AF",
                       command=self._export_filtered_csv).pack(side='left', padx=6)
+        ctk.CTkButton(top, text="📄 Export Filtered JSON", fg_color="#065F46",
+                      hover_color="#047857",
+                      command=self._export_filtered_json).pack(side='left', padx=6)
         ctk.CTkButton(top, text="📊 Export All CSV", fg_color="#B91C1C",
                       hover_color="#991B1B", command=self._export_all_csv).pack(side='right')
+        ctk.CTkButton(top, text="📄 Export All JSON", fg_color="#7C3AED",
+                      hover_color="#6D28D9", command=self._export_all_json).pack(side='right', padx=6)
 
         # Row count label
         self._count_label = ctk.CTkLabel(top, text="", font=ctk.CTkFont(size=11),
@@ -1706,6 +1812,43 @@ class HistoryDialog(ctk.CTkToplevel):
         count = self._db.export_all_csv(path)
         messagebox.showinfo("Export", f"Exported {count} records to:\n{path}")
 
+    def _export_filtered_json(self):
+        """Export only the currently-displayed (filtered) rows to JSON.
+
+        v3.0.2: JSON complement to :meth:`_export_filtered_csv`.
+        """
+        ts     = datetime.now().strftime('%Y%m%d_%H%M%S')
+        search = self._search_var.get().strip()
+        initial = f"history_filtered_{ts}.json" if search else f"history_export_{ts}.json"
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=initial,
+            initialdir=_config.get("export_directory", str(Path.home())),
+            filetypes=[("JSON files", "*.json")]
+        )
+        if not path:
+            return
+        limit = _config.get("history_limit", 500)
+        count = self._db.export_filtered_json(path, search=search, limit=limit)
+        messagebox.showinfo("Export", f"Exported {count} records to:\n{path}")
+
+    def _export_all_json(self):
+        """Export all scan records to a JSON file.
+
+        v3.0.2: JSON complement to :meth:`_export_all_csv`.
+        """
+        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = ctk.filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=f"history_export_{ts}.json",
+            initialdir=_config.get("export_directory", str(Path.home())),
+            filetypes=[("JSON files", "*.json")]
+        )
+        if not path:
+            return
+        count = self._db.export_all_json(path)
+        messagebox.showinfo("Export", f"Exported {count} records to:\n{path}")
+
 
 # ─────────────────────────────────────────────────────────────────
 # Shortcuts Help Dialog
@@ -1716,6 +1859,7 @@ class ShortcutsDialog(ctk.CTkToplevel):
 
     _SHORTCUTS = [
         ("Ctrl + O",       "Load directory"),
+        ("Ctrl + V",       "Paste image from clipboard"),
         ("Ctrl + S",       "Scan current image"),
         ("Ctrl + E",       "Export to CSV"),
         ("Ctrl + H",       "Open scan history"),
@@ -1925,6 +2069,23 @@ class NextLevelOCRScanner(ctk.CTk):
                 self.sidebar_frame, text=text,
                 fg_color=fg, hover_color=hov, command=cmd
             ).pack(fill='x', padx=16, pady=5)
+
+        # Paste-from-clipboard and Recent-dirs row (v3.0.2)
+        clip_row = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        clip_row.pack(fill='x', padx=16, pady=(2, 0))
+        clip_row.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(
+            clip_row, text="📋 Paste", width=0,
+            fg_color="#0F172A", hover_color="#1E293B",
+            font=ctk.CTkFont(size=11),
+            command=self.paste_image_from_clipboard,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ctk.CTkButton(
+            clip_row, text="📂 Recent", width=0,
+            fg_color="#0F172A", hover_color="#1E293B",
+            font=ctk.CTkFont(size=11),
+            command=self._open_recent_dirs,
+        ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         ctk.CTkFrame(self.sidebar_frame, height=1, fg_color="#334155").pack(
             fill='x', padx=16, pady=10)
@@ -2242,6 +2403,8 @@ class NextLevelOCRScanner(ctk.CTk):
     def _bind_shortcuts(self):
         self.bind("<Control-o>", lambda e: self.load_directory())
         self.bind("<Control-O>", lambda e: self.load_directory())
+        self.bind("<Control-v>", lambda e: self.paste_image_from_clipboard())
+        self.bind("<Control-V>", lambda e: self.paste_image_from_clipboard())
         self.bind("<Control-s>", lambda e: self.start_scan_thread())
         self.bind("<Control-S>", lambda e: self.start_scan_thread())
         self.bind("<Control-e>", lambda e: self.export_to_csv())
@@ -2323,6 +2486,7 @@ class NextLevelOCRScanner(ctk.CTk):
         if not dir_path:
             return
         _config["last_directory"] = dir_path
+        self._update_recent_dirs(dir_path)
         save_config(_config)
         for w in self.scrollable_file_list.winfo_children():
             w.destroy()
@@ -2352,6 +2516,9 @@ class NextLevelOCRScanner(ctk.CTk):
         )
         if not path:
             return
+        parent_dir = os.path.dirname(path)
+        if parent_dir:
+            self._update_recent_dirs(parent_dir)
         for w in self.scrollable_file_list.winfo_children():
             w.destroy()
         self.image_files  = [path]
@@ -2380,6 +2547,141 @@ class NextLevelOCRScanner(ctk.CTk):
         except Exception as exc:
             logger.error("ZIP extraction failed: %s", exc)
             messagebox.showerror("Error", f"Failed to extract ZIP:\n{exc}")
+
+    # ──────────────────────────────────────────────────────────
+    # Recent directories (v3.0.2)
+    # ──────────────────────────────────────────────────────────
+
+    _RECENT_DIRS_MAX = 10
+
+    def _update_recent_dirs(self, dir_path: str) -> None:
+        """Prepend *dir_path* to the recent-directories list and persist it."""
+        recent: list = _config.get("recent_dirs", [])
+        if dir_path in recent:
+            recent.remove(dir_path)
+        recent.insert(0, dir_path)
+        _config["recent_dirs"] = recent[:self._RECENT_DIRS_MAX]
+        save_config(_config)
+
+    def _open_recent_dirs(self) -> None:
+        """Show a modal dialog listing recently opened directories.
+
+        Clicking an entry loads that directory immediately.  Entries that no
+        longer exist on disk are shown in a dimmed style and cannot be opened.
+
+        v3.0.2 feature.
+        """
+        recent: list = _config.get("recent_dirs", [])
+        if not recent:
+            self._show_toast("📂 No recent directories yet.", color="#1E293B",
+                             text_color="#94A3B8")
+            return
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("📂 Recent Directories")
+        dlg.geometry("540x380")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ctk.CTkLabel(dlg, text="Recent Directories",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(16, 8))
+
+        frame = ctk.CTkScrollableFrame(dlg, fg_color="transparent")
+        frame.pack(fill='both', expand=True, padx=16, pady=(0, 8))
+
+        def _pick(p: str):
+            dlg.destroy()
+            self.load_directory(p)
+
+        for p in recent:
+            exists = os.path.isdir(p)
+            row = ctk.CTkFrame(frame, fg_color="#1E293B" if exists else "#111827",
+                               corner_radius=4)
+            row.pack(fill='x', pady=2)
+            row.grid_columnconfigure(0, weight=1)
+            lbl = ctk.CTkLabel(
+                row, text=p,
+                text_color="#CBD5E1" if exists else "#4B5563",
+                font=ctk.CTkFont(size=11), anchor="w",
+                wraplength=440,
+            )
+            lbl.grid(row=0, column=0, sticky="ew", padx=(10, 4), pady=6)
+            if exists:
+                lbl.bind("<Button-1>", lambda _e, path=p: _pick(path))
+                row.bind("<Button-1>", lambda _e, path=p: _pick(path))
+                ctk.CTkButton(
+                    row, text="Open", width=56, height=24,
+                    fg_color="#3B82F6", hover_color="#2563EB",
+                    font=ctk.CTkFont(size=10),
+                    command=lambda path=p: _pick(path),
+                ).grid(row=0, column=1, padx=(4, 8))
+            else:
+                ctk.CTkLabel(
+                    row, text="(missing)", width=56,
+                    text_color="#6B7280", font=ctk.CTkFont(size=10),
+                ).grid(row=0, column=1, padx=(4, 8))
+
+        ctk.CTkButton(dlg, text="Close", width=120,
+                      command=dlg.destroy).pack(pady=(0, 14))
+
+    # ──────────────────────────────────────────────────────────
+    # Paste image from clipboard (v3.0.2)
+    # ──────────────────────────────────────────────────────────
+
+    def paste_image_from_clipboard(self) -> None:
+        """Load an image pasted from the system clipboard.
+
+        Saves the clipboard image to a temporary file in the OS temp directory,
+        then loads it into the scanner as a single-image session.
+
+        Works on Windows and macOS.  On Linux / headless environments it shows
+        a friendly error toast when the clipboard does not contain an image.
+
+        v3.0.2 feature.
+        """
+        if not _IMAGEGRAB_AVAILABLE:
+            self._show_toast("⚠️ Clipboard paste not supported on this platform.",
+                             color="#450A0A", text_color="#FCA5A5")
+            return
+        try:
+            img = ImageGrab.grabclipboard()
+        except Exception as exc:
+            logger.warning("Clipboard grab error: %s", exc)
+            img = None
+
+        if img is None:
+            self._show_toast("📋 Clipboard is empty or contains no image.",
+                             color="#1E293B", text_color="#94A3B8")
+            return
+
+        # Save to a temp file so the rest of the pipeline can open it by path
+        try:
+            import tempfile
+            tmp_dir = Path(tempfile.gettempdir()) / _CLIPBOARD_TEMP_DIR
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            tmp_path = str(tmp_dir / f"clipboard_{ts}.png")
+            img.save(tmp_path, format="PNG")
+        except Exception as exc:
+            logger.error("Failed to save clipboard image: %s", exc)
+            messagebox.showerror("Clipboard Error",
+                                 f"Could not save clipboard image:\n{exc}")
+            return
+
+        for w in self.scrollable_file_list.winfo_children():
+            w.destroy()
+        self.image_files  = [tmp_path]
+        self.file_buttons = {}
+        self._thumb_refs  = {}
+        self._row_frames  = {}
+        self._add_file_button(tmp_path)
+        self._file_count_label.configure(text="(1)")
+        self.display_image(tmp_path)
+        self._update_nav_buttons()
+        self.set_status("📋 Image pasted from clipboard.")
+        logger.info("Clipboard image loaded: %s", tmp_path)
+        self._show_toast("📋 Clipboard image loaded!", color="#0F172A",
+                         text_color="#38BDF8")
 
     def _add_file_button(self, path: str):
         if _config.get("show_thumbnails", True):
@@ -3145,6 +3447,30 @@ class NextLevelOCRScanner(ctk.CTk):
         if fields_n > 0:
             self._show_toast(f"✅ {fields_n} fields extracted in {elapsed_ms} ms",
                              color="#0F2027", text_color="#34D399")
+
+            # v3.0.2: Duplicate detection — warn if the same transaction code was
+            # already saved previously.
+            tx_code = self.latest_metadata.get("Mã giao dịch", "")
+            if tx_code:
+                dup_count = _db.check_duplicate(tx_code)
+                # dup_count includes the record we just saved, so > 1 means duplicates
+                if dup_count > 1:
+                    self.after(_DUPLICATE_TOAST_DELAY_MS, lambda: self._show_toast(
+                        f"⚠️ Duplicate detected! '{tx_code}' already in DB ({dup_count} times).",
+                        color="#451A03", text_color="#FCD34D", duration_ms=4000))
+                    logger.warning("Duplicate transaction code detected: %s (%d records)",
+                                   tx_code, dup_count)
+
+            # v3.0.2: Auto-copy JSON to clipboard if configured
+            if _config.get("auto_copy_on_scan", False):
+                try:
+                    self.clipboard_clear()
+                    self.clipboard_append(
+                        json.dumps(self.latest_metadata, ensure_ascii=False, indent=4))
+                    logger.debug("Auto-copied scan JSON to clipboard.")
+                except Exception:
+                    pass
+
         logger.info("Single scan done: %dms, fields=%d",
                     elapsed_ms, len(metadata) if metadata else 0)
 
