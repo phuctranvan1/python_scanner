@@ -4,7 +4,7 @@
 
 **Enterprise-grade OCR tool for extracting structured data from Vietnamese ETC toll receipts**
 
-[![Version](https://img.shields.io/badge/version-3.0.1-brightgreen)](#)
+[![Version](https://img.shields.io/badge/version-4.0.3-brightgreen)](#)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](#)
 
@@ -143,6 +143,14 @@ The application auto-detects the receipt type and falls back to the alternate pa
 ---
 
 ## Changelog
+
+### v4.0.3
+- Toast notifications now fade **out** smoothly before dismiss (complements existing fade-in)
+- Preview canvas re-renders automatically on window resize with a 50 ms debounce — no more stale image after resizing
+- Thumbnail loading uses a shared `ThreadPoolExecutor` (max 4 workers) instead of spawning a new thread per image — lower overhead with large directories
+- **Single scan**: Tesseract text, Tesseract word-boxes, and EasyOCR now all run in a single parallel pool — reduces wall-clock latency in dual mode
+- **Batch scan**: Tesseract and EasyOCR run in parallel per image (previously sequential) — faster batch throughput
+- Thumbnail pool shuts down gracefully when the window is closed
 
 ### v3.0.1
 - Added PSM 4 (single-column) as a third Tesseract candidate
