@@ -4,7 +4,7 @@
 
 **Enterprise-grade OCR tool for extracting structured data from Vietnamese ETC toll receipts**
 
-[![Version](https://img.shields.io/badge/version-4.0.3-brightgreen)](#)
+[![Version](https://img.shields.io/badge/version-4.0.4-brightgreen)](#)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](#)
 
@@ -14,7 +14,7 @@
 
 ## Overview
 
-**VETC Toll Receipt OCR Scanner** is a desktop application that automatically extracts structured data (transaction code, licence plate, EPC/RFID, timestamps, prices, etc.) from screenshots or photographs of VETC toll-booth receipts. It uses a **dual OCR engine** — Tesseract LSTM and EasyOCR CRNN — in parallel, then merges the results for maximum accuracy.
+**VETC Toll Receipt OCR Scanner** is a desktop application that automatically extracts structured data (transaction code, licence plate, EPC/RFID, timestamps, prices, etc.) from screenshots or photographs of VETC toll-booth receipts. It uses a **triple OCR engine** — Tesseract LSTM, EasyOCR CRNN, and PaddleOCR — running in parallel, then merges the results with majority-vote confidence fusion for maximum accuracy.
 
 ---
 
@@ -80,14 +80,14 @@ Configure the Tesseract binary path, database file, default export directory, ap
 
 | Feature | Description |
 |---|---|
-| **Dual OCR engine** | Tesseract (PSM 4/6/11) + EasyOCR run in parallel; results merged by confidence voting |
+| **Triple OCR engine** | Tesseract (PSM 4/6/11) + EasyOCR + PaddleOCR run in parallel; results merged by majority-vote confidence fusion |
 | **Auto-preprocessing** | Adaptive binarization, CLAHE contrast enhancement, deskew, upscaling — tuned per image brightness |
 | **Smart parsing** | Detects Type 1 (vertical web UI) and Type 2 (VETC app key:value) receipt layouts automatically |
 | **Batch scan** | Process a whole directory at once with ETA estimate and cancel support |
 | **OCR bounding boxes** | Colour-coded confidence overlays on the preview canvas; click a box to highlight it in the raw text |
 | **Scan history** | SQLite database with full-text search, sortable columns, CSV export |
 | **ZIP import** | Load a ZIP of receipt images directly — no manual extraction needed |
-| **Configurable OCR mode** | `dual` \| `tesseract_only` \| `easyocr_only` |
+| **Configurable OCR mode** | `triple` \| `dual` \| `tesseract_only` \| `easyocr_only` \| `paddle_only` |
 | **Keyboard shortcuts** | Full keyboard navigation (Ctrl+S scan, Ctrl+O load, arrow-key navigation, R rotate, …) |
 | **Export** | Copy JSON to clipboard, export single record or full history to CSV / JSON |
 
@@ -100,7 +100,7 @@ Configure the Tesseract binary path, database file, default export directory, ap
 - Python packages:
 
 ```bash
-pip install customtkinter pillow opencv-python pytesseract easyocr numpy
+pip install customtkinter pillow opencv-python pytesseract easyocr paddleocr paddlepaddle numpy
 ```
 
 ---
@@ -113,7 +113,7 @@ git clone https://github.com/phuctranvan1/python_scanner.git
 cd python_scanner
 
 # 2. Install dependencies
-pip install customtkinter pillow opencv-python pytesseract easyocr numpy
+pip install customtkinter pillow opencv-python pytesseract easyocr paddleocr paddlepaddle numpy
 
 # 3. (Windows) Set Tesseract path in Settings, or edit the default config
 #    Default search paths: C:\Program Files\Tesseract-OCR\tesseract.exe
@@ -143,6 +143,15 @@ The application auto-detects the receipt type and falls back to the alternate pa
 ---
 
 ## Changelog
+
+### v4.0.4
+- **PaddleOCR** added as a third OCR engine alongside Tesseract and EasyOCR
+- New default OCR mode `triple` runs all three engines in parallel and fuses results via majority-vote confidence scoring
+- New OCR modes: `triple` (all three), `paddle_only`; existing `dual`, `tesseract_only`, `easyocr_only` still available
+- PaddleOCR bounding boxes rendered in the preview overlay; new `paddle` option in the box-source selector
+- `merge_triple_ocr()`: per-line majority-vote fusion — numeric fields prefer the higher-confidence neural engine; Vietnamese text lines use SequenceMatcher agreement between the two neural engines
+- PaddleOCR raw output shown in the **Raw OCR Text** tab (`=== PADDLEOCR RAW ===` section)
+- PaddleOCR is lazy-loaded on first use and gracefully skipped if the package is not installed
 
 ### v4.0.3
 - Toast notifications now fade **out** smoothly before dismiss (complements existing fade-in)
