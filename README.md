@@ -4,7 +4,7 @@
 
 **Enterprise-grade OCR tool for extracting structured data from Vietnamese ETC toll receipts**
 
-[![Version](https://img.shields.io/badge/version-4.0.5-brightgreen)](#)
+[![Version](https://img.shields.io/badge/version-4.0.6-brightgreen)](#)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](#)
 
@@ -81,6 +81,7 @@ Configure the Tesseract binary path, database file, default export directory, ap
 | Feature | Description |
 |---|---|
 | **Triple OCR engine** | Tesseract (PSM 4/6/11) + EasyOCR + PaddleOCR run in parallel; results merged by majority-vote confidence fusion |
+| **Area selection** | Drag a rectangle on the preview to select a region of interest; **🔲 Scan Region** runs OCR on the crop only |
 | **Auto-preprocessing** | Adaptive binarization, CLAHE contrast enhancement, deskew, upscaling — tuned per image brightness |
 | **Smart parsing** | Detects Type 1 (vertical web UI) and Type 2 (VETC app key:value) receipt layouts automatically |
 | **Batch scan** | Process a whole directory at once with ETA estimate and cancel support |
@@ -88,7 +89,7 @@ Configure the Tesseract binary path, database file, default export directory, ap
 | **Scan history** | SQLite database with full-text search, sortable columns, CSV export |
 | **ZIP import** | Load a ZIP of receipt images directly — no manual extraction needed |
 | **Configurable OCR mode** | `triple` \| `dual` \| `tesseract_only` \| `easyocr_only` \| `paddle_only` |
-| **Keyboard shortcuts** | Full keyboard navigation (Ctrl+S scan, Ctrl+O load, arrow-key navigation, R rotate, …) |
+| **Keyboard shortcuts** | Full keyboard navigation (Ctrl+S scan, Ctrl+X scan region, Ctrl+O load, arrow-key navigation, R rotate, …) |
 | **Export** | Copy JSON to clipboard, export single record or full history to CSV / JSON |
 
 ---
@@ -143,6 +144,14 @@ The application auto-detects the receipt type and falls back to the alternate pa
 ---
 
 ## Changelog
+
+### v4.0.6
+- **Feature**: Area-selection tool — click **✂ Select** in the preview toolbar to enter selection mode, then drag a rectangle on the image to define a region of interest
+- **Feature**: **🔲 Scan Region** button in the results panel — runs the full triple-engine OCR pipeline on the selected crop only, useful for isolating dense receipt sections or skipping noisy borders
+- **Feature**: **✕ Clear Sel** button to dismiss the selection overlay at any time
+- **Feature**: `Ctrl+X` keyboard shortcut to scan the selected region; `Escape` to clear selection
+- **Feature**: Live dimension readout in the status bar while dragging a selection (`[W×H px]`)
+- **Enhancement**: Selection rectangle (dashed blue overlay) persists across zoom, pan, and box-toggle re-renders, and is automatically cleared when a new image is loaded or the image is rotated
 
 ### v4.0.5
 - **Fix**: Missing `app.mainloop()` at entry point — app would exit immediately on some platforms
