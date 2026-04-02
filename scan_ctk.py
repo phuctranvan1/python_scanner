@@ -42,8 +42,19 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "4.0.2"
+APP_VERSION = "4.0.3"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
+# Changelog v4.0.3:
+#   - Toast: smooth fade-out animation before dismiss (complements existing fade-in)
+#   - Canvas: debounced <Configure> handler (50 ms) — prevents render flooding on resize
+#   - Thumbnail loading: shared ThreadPoolExecutor (max 4 workers) replaces per-image threads
+#   - Single scan: Tesseract text, Tesseract boxes, and EasyOCR now run in one parallel pool
+#   - Batch scan: Tesseract and EasyOCR run in parallel per image (reduced per-image latency)
+#   - Graceful shutdown of thumbnail pool on window close
+
+# Changelog v4.0.2:
+#   (internal patch — no user-visible changes)
+
 # Changelog v4.0.1:
 #   - Quick field-copy buttons in Structured Data panel
 #   - Image info overlay (W×H px, file size, format)
@@ -2307,6 +2318,10 @@ class NextLevelOCRScanner(ctk.CTk):
         self._batch_running          = False
         self._batch_cancel           = threading.Event()
         self._rotation_angle: int    = 0    # cumulative rotation (0/90/180/270)
+        # v4.0.3: debounce token for canvas resize re-renders
+        self._render_debounce_id: str | None = None
+        # v4.0.3: shared pool for async thumbnail loading (replaces per-image daemon threads)
+        self._thumb_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="thumb")
 
         # ── Bounding-box / OCR overlay state ───────────────────
         self._ocr_boxes_easy: list       = []   # [(bbox_quad, text, conf), ...]
@@ -2345,6 +2360,11 @@ class NextLevelOCRScanner(ctk.CTk):
         try:
             _config["window_geometry"] = self.geometry()
             save_config(_config)
+        except Exception:
+            pass
+        # v4.0.3: shut down the thumbnail pool without blocking the UI thread
+        try:
+            self._thumb_pool.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
         self.destroy()
@@ -2549,6 +2569,8 @@ class NextLevelOCRScanner(ctk.CTk):
         self._preview_canvas.bind("<Button-1>",   self._on_canvas_click)
         self._preview_canvas.bind("<Motion>",     self._on_canvas_hover)
         self._preview_canvas.bind("<Leave>",      self._on_canvas_leave)
+        # v4.0.3: re-render image when the canvas is resized (debounced 50 ms)
+        self._preview_canvas.bind("<Configure>",  self._on_canvas_configure)
 
         # Placeholder text
         self._preview_canvas.create_text(
@@ -2793,7 +2815,7 @@ class NextLevelOCRScanner(ctk.CTk):
 
     def _show_toast(self, msg: str, color: str = "#1E293B",
                     text_color: str = "#00FFAA", duration_ms: int = 2500):
-        """Display a brief floating toast with fade-in animation (v4.0.1)."""
+        """Display a brief floating toast with fade-in/out animation (v4.0.3)."""
         try:
             tw = tk.Toplevel(self)
             tw.wm_overrideredirect(True)
@@ -2807,7 +2829,7 @@ class NextLevelOCRScanner(ctk.CTk):
                            font=("Segoe UI", 11), relief="flat",
                            padx=18, pady=8, bd=1)
             lbl.pack()
-            # Fade-in: increase alpha in steps over 200 ms
+            # Fade-in: increase alpha in 10 steps over ~200 ms
             def _fade_in(step=0):
                 alpha = min(1.0, step * 0.1)
                 try:
@@ -2816,8 +2838,22 @@ class NextLevelOCRScanner(ctk.CTk):
                     return
                 if alpha < 1.0:
                     tw.after(20, _fade_in, step + 1)
+            # Fade-out: decrease alpha in 10 steps over ~200 ms then destroy (v4.0.3)
+            def _fade_out(step=10):
+                alpha = max(0.0, step * 0.1)
+                try:
+                    tw.attributes("-alpha", alpha)
+                except Exception:
+                    return
+                if alpha > 0.0:
+                    tw.after(20, _fade_out, step - 1)
+                else:
+                    try:
+                        tw.destroy()
+                    except Exception:
+                        pass
             _fade_in()
-            tw.after(duration_ms, tw.destroy)
+            tw.after(duration_ms, _fade_out)
         except Exception:
             pass
 
@@ -2921,7 +2957,7 @@ class NextLevelOCRScanner(ctk.CTk):
             # Store container frame so _remove_current_from_list can destroy it directly
             self._row_frames[path] = row_frame
 
-            # Load thumbnail in background
+            # Load thumbnail in background via the shared pool (v4.0.3)
             def _load_thumb(p=path, lbl=thumb_label):
                 try:
                     img = Image.open(p)
@@ -2931,7 +2967,7 @@ class NextLevelOCRScanner(ctk.CTk):
                     lbl.after(0, lambda i=tk_img: lbl.configure(image=i, text=""))
                 except Exception:
                     pass
-            threading.Thread(target=_load_thumb, daemon=True).start()
+            self._thumb_pool.submit(_load_thumb)
         else:
             btn = ctk.CTkButton(
                 self.scrollable_file_list, text=os.path.basename(path),
@@ -3390,6 +3426,18 @@ class NextLevelOCRScanner(ctk.CTk):
         else:
             self._zoom(1 / 1.1)
 
+    def _on_canvas_configure(self, _event):
+        """Re-render the preview image when the canvas is resized (v4.0.3).
+
+        A 50 ms debounce prevents repeated renders while the user is actively
+        dragging the window border.
+        """
+        if self._base_pil_img is None:
+            return
+        if self._render_debounce_id is not None:
+            self.after_cancel(self._render_debounce_id)
+        self._render_debounce_id = self.after(50, self._render_image)
+
     def _on_canvas_click(self, event):
         """Click on canvas background (not on a box) — show pixel info."""
         ox, oy = self._canvas_img_offset
@@ -3552,16 +3600,22 @@ class NextLevelOCRScanner(ctk.CTk):
             easy_boxes = []
             tess_boxes = []
 
-            if ocr_mode in ("dual", "tesseract_only"):
-                # Run Tesseract text + word boxes in parallel
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    fut_tess       = ex.submit(run_tesseract,       img_tess)
-                    fut_tess_boxes = ex.submit(get_tess_word_boxes, img_tess)
-                    tess_text  = fut_tess.result()
-                    tess_boxes = fut_tess_boxes.result()
+            # v4.0.3: run all eligible OCR tasks in one parallel pool to minimise
+            # total wall-clock latency (previously tess-boxes and EasyOCR were serial)
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                fut_tess       = (ex.submit(run_tesseract,       img_tess)
+                                  if ocr_mode in ("dual", "tesseract_only") else None)
+                fut_tess_boxes = (ex.submit(get_tess_word_boxes, img_tess)
+                                  if ocr_mode in ("dual", "tesseract_only") else None)
+                fut_easy       = (ex.submit(run_easyocr,         img_easy)
+                                  if ocr_mode in ("dual", "easyocr_only")   else None)
 
-            if ocr_mode in ("dual", "easyocr_only"):
-                easy_text, easy_conf, easy_boxes = run_easyocr(img_easy)
+                if fut_tess is not None:
+                    tess_text  = fut_tess.result()
+                if fut_tess_boxes is not None:
+                    tess_boxes = fut_tess_boxes.result()
+                if fut_easy is not None:
+                    easy_text, easy_conf, easy_boxes = fut_easy.result()
 
             if ocr_mode == "easyocr_only":
                 engine_label   = f"EasyOCR (conf: {easy_conf * 100:.1f}%)"
@@ -3837,11 +3891,16 @@ class NextLevelOCRScanner(ctk.CTk):
                 easy_text = ""
                 conf      = 0.0
 
-                if ocr_mode in ("dual", "tesseract_only"):
-                    tess_text = run_tesseract(img_tess)
-                if ocr_mode in ("dual", "easyocr_only"):
-                    with ThreadPoolExecutor(max_workers=1) as ex:
-                        easy_text, conf, _ = ex.submit(run_easyocr, img_easy).result()
+                # v4.0.3: run Tesseract and EasyOCR in parallel to reduce per-image latency
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    fut_tess = (ex.submit(run_tesseract, img_tess)
+                                if ocr_mode in ("dual", "tesseract_only") else None)
+                    fut_easy = (ex.submit(run_easyocr,   img_easy)
+                                if ocr_mode in ("dual", "easyocr_only")   else None)
+                    if fut_tess is not None:
+                        tess_text = fut_tess.result()
+                    if fut_easy is not None:
+                        easy_text, conf, _ = fut_easy.result()
 
                 elapsed_ms = int((time.time() - t0) * 1000)
 
