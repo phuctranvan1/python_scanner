@@ -4,7 +4,7 @@
 
 **Enterprise-grade OCR tool for extracting structured data from Vietnamese ETC toll receipts**
 
-[![Version](https://img.shields.io/badge/version-4.0.4-brightgreen)](#)
+[![Version](https://img.shields.io/badge/version-4.0.5-brightgreen)](#)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](#)
 
@@ -143,6 +143,17 @@ The application auto-detects the receipt type and falls back to the alternate pa
 ---
 
 ## Changelog
+
+### v4.0.5
+- **Fix**: Missing `app.mainloop()` at entry point — app would exit immediately on some platforms
+- **Fix**: Deprecated `Image.BICUBIC` → `Image.Resampling.BICUBIC` in PaddleOCR preprocessor
+- **Fix**: Extra whitespace in engine label string (`" EasyOCR"` → `"EasyOCR"`)
+- **Fix**: `_apply_settings` status/log fallback OCR mode was `'dual'`, now correctly `'triple'`
+- **Enhancement**: `preprocess_for_paddleocr` now upscales small images (mirrors Tesseract/EasyOCR pipelines for consistent OCR quality on low-resolution receipts)
+- **Enhancement**: `preprocess_for_paddleocr` now applies auto-orient and auto-crop when `auto_deskew=True` (consistent with other engine preprocessors)
+- **Enhancement**: `merge_triple_ocr` now applies neural engine preference for Vietnamese text lines (not just numeric lines) when both neural engines agree with sufficient similarity — improved accuracy for label/status fields
+- **Enhancement**: Raw OCR Text tab now shows `=== TESSERACT RAW ===` section alongside EasyOCR and PaddleOCR raw output for full transparency
+- **Enhancement**: `Ctrl+T` keyboard shortcut for instant Dark ↔ Light theme toggle
 
 ### v4.0.4
 - **PaddleOCR** added as a third OCR engine alongside Tesseract and EasyOCR

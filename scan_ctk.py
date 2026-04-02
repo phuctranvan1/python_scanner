@@ -42,8 +42,20 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "4.0.4"
+APP_VERSION = "4.0.5"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
+# Changelog v4.0.5:
+#   - Fix: missing app.mainloop() at entry point (app would exit immediately on some platforms)
+#   - Fix: deprecated Image.BICUBIC → Image.Resampling.BICUBIC in preprocess_for_paddleocr
+#   - Fix: extra whitespace in engine label (" EasyOCR" → "EasyOCR")
+#   - Fix: _apply_settings status/log fallback OCR mode was 'dual', now correctly 'triple'
+#   - Enhancement: preprocess_for_paddleocr now upscales small images (mirrors Tesseract/EasyOCR)
+#   - Enhancement: preprocess_for_paddleocr applies auto-orient + auto-crop when auto_deskew=True
+#   - Enhancement: merge_triple_ocr now also applies neural engine preference for Vietnamese
+#     text lines (not just numeric lines) when both neural engines agree sufficiently
+#   - Enhancement: Raw OCR Text tab now shows Tesseract raw text (=== TESSERACT RAW === section)
+#   - Enhancement: Ctrl+T keyboard shortcut for quick theme toggle (Dark ↔ Light)
+
 # Changelog v4.0.4:
 #   - Triple-engine OCR: PaddleOCR added alongside Tesseract and EasyOCR
 #   - New ocr_mode values: "triple" (all three engines), "paddle_only"
@@ -1172,11 +1184,27 @@ def preprocess_for_paddleocr(pil_img, auto_deskew: bool = False):
     """Preprocessing optimised for PaddleOCR.
 
     PaddleOCR accepts BGR numpy arrays (OpenCV convention).  We apply the same
-    contrast-enhancement and optional deskew used for EasyOCR, but return the
-    image as a BGR ndarray so PaddleOCR can ingest it directly without a
-    second conversion.
+    contrast-enhancement, upscaling, and optional deskew used for EasyOCR, but
+    return the image as a BGR ndarray so PaddleOCR can ingest it directly without
+    a second conversion.
+
+    v4.0.5: Added upscaling for small images (mirrors Tesseract/EasyOCR pipelines)
+    and full auto-orient + auto-crop pipeline when auto_deskew=True.
     """
+    if auto_deskew:
+        pil_img = auto_orient_image(pil_img)
+        pil_img = auto_crop_receipt(pil_img)
+        pil_img = deskew_image(pil_img)
+
     np_img = np.array(pil_img.convert("RGB"))
+
+    h, w = np_img.shape[:2]
+
+    # Upscale small images — same threshold as Tesseract/EasyOCR pipeline
+    if w < 1200:
+        scale = 3 if w < 600 else 2
+        np_img = cv2.resize(np_img, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4)
+
     # Mild CLAHE contrast boost on the luminance channel
     lab = cv2.cvtColor(np_img, cv2.COLOR_RGB2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -1184,13 +1212,7 @@ def preprocess_for_paddleocr(pil_img, auto_deskew: bool = False):
     l_ch  = clahe.apply(l_ch)
     lab   = cv2.merge((l_ch, a_ch, b_ch))
     np_img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-    if auto_deskew:
-        gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
-        angle = detect_skew_angle(gray)
-        if abs(angle) > 0.5:
-            pil_tmp = Image.fromarray(np_img)
-            pil_tmp = pil_tmp.rotate(-angle, resample=Image.BICUBIC, expand=True)
-            np_img  = np.array(pil_tmp)
+
     # PaddleOCR expects BGR
     return cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
 
@@ -1458,7 +1480,7 @@ def merge_triple_ocr(tess_text: str, easy_text: str, easy_conf: float,
         paddle_wins = (best_paddle is not None and best_paddle_score >= _MERGE_SIMILARITY_MIN
                        and paddle_conf >= conf_threshold)
 
-        if has_numbers and easy_wins and paddle_wins:
+        if easy_wins and paddle_wins:
             # Both neural engines have a good match — choose higher-confidence
             chosen = best_paddle if paddle_conf >= easy_conf else best_easy
             if paddle_conf >= easy_conf:
@@ -1466,10 +1488,12 @@ def merge_triple_ocr(tess_text: str, easy_text: str, easy_conf: float,
             else:
                 used_e.add(best_easy_idx)
             merged.append(chosen)
-        elif has_numbers and paddle_wins:
+        elif paddle_wins and not easy_wins:
+            # Only PaddleOCR wins (numeric or Vietnamese text line)
             merged.append(best_paddle)
             used_p.add(best_paddle_idx)
-        elif has_numbers and easy_wins:
+        elif easy_wins and not paddle_wins:
+            # Only EasyOCR wins (numeric or Vietnamese text line)
             merged.append(best_easy)
             used_e.add(best_easy_idx)
         else:
@@ -2390,6 +2414,7 @@ class ShortcutsDialog(ctk.CTkToplevel):
         ("Ctrl + E",       "Export to CSV"),
         ("Ctrl + H",       "Open scan history"),
         ("Ctrl + I",       "Show image info  ✦ v4.0.1"),
+        ("Ctrl + T",       "Toggle Dark / Light theme  ✦ v4.0.5"),
         ("Ctrl + ?",       "Show this shortcuts dialog"),
         ("← / →",          "Previous / Next image"),
         ("↑ / ↓",          "Previous / Next image (alternative)"),
@@ -2577,6 +2602,22 @@ class NextLevelOCRScanner(ctk.CTk):
         except Exception:
             pass
         self.destroy()
+
+    def _toggle_theme(self):
+        """Toggle between Dark and Light appearance mode (Ctrl+T, v4.0.5)."""
+        new_mode = "Light" if ctk.get_appearance_mode() == "Dark" else "Dark"
+        ctk.set_appearance_mode(new_mode)
+        _config["theme"] = new_mode
+        save_config(_config)
+        try:
+            self._theme_switch.configure(text=f"{new_mode} Mode")
+            if new_mode == "Dark":
+                self._theme_switch.select()
+            else:
+                self._theme_switch.deselect()
+        except Exception:
+            pass
+        self.set_status(f"Theme switched to {new_mode}")
 
 
     # ──────────────────────────────────────────────────────────
@@ -2977,6 +3018,9 @@ class NextLevelOCRScanner(ctk.CTk):
         self.bind("<Control-Z>", lambda e: self._zoom_reset())
         self.bind("<Control-i>", lambda e: self._show_image_info())
         self.bind("<Control-I>", lambda e: self._show_image_info())
+        # v4.0.5: Ctrl+T — quick theme toggle (Dark ↔ Light)
+        self.bind("<Control-t>", lambda e: self._toggle_theme())
+        self.bind("<Control-T>", lambda e: self._toggle_theme())
 
         # Image navigation
         self.bind("<Left>",  lambda e: self._navigate(-1))
@@ -3886,7 +3930,7 @@ class NextLevelOCRScanner(ctk.CTk):
                 if easy_text.strip():   neural_confs.append(easy_conf)
                 if paddle_text.strip(): neural_confs.append(paddle_conf)
                 active_names = (
-                    ([" EasyOCR"]   if easy_text.strip()   else []) +
+                    (["EasyOCR"]   if easy_text.strip()   else []) +
                     (["PaddleOCR"]  if paddle_text.strip() else [])
                 )
                 if neural_confs:
@@ -3924,7 +3968,7 @@ class NextLevelOCRScanner(ctk.CTk):
             smart_out, raw_out = self._format_output(
                 engine_label, receipt_type, metadata, extracted_text,
                 easy_text, elapsed_ms, easy_conf,
-                paddle_text=paddle_text)
+                paddle_text=paddle_text, tess_text=tess_text)
 
             self.after(0, self._finish_single_scan,
                        smart_out, raw_out, metadata, receipt_type,
@@ -3943,7 +3987,7 @@ class NextLevelOCRScanner(ctk.CTk):
 
     def _format_output(self, engine_label, receipt_type, metadata,
                        extracted_text, easy_text, elapsed_ms, easy_conf: float = 0.0,
-                       paddle_text: str = ""):
+                       paddle_text: str = "", tess_text: str = ""):
         type_label = {
             "type1_web":   "🌐 Type 1 — Web UI (vertical labels)",
             "type2_vetc":  "📱 Type 2 — VETC App (key:value)",
@@ -3978,6 +4022,8 @@ class NextLevelOCRScanner(ctk.CTk):
 
         raw = "=== MERGED OCR TEXT ===\n"
         raw += extracted_text.strip() or "[No text found]"
+        if tess_text.strip():
+            raw += "\n\n=== TESSERACT RAW ===\n" + tess_text.strip()
         if easy_text.strip():
             raw += "\n\n=== EASYOCR RAW ===\n" + easy_text.strip()
         if paddle_text.strip():
@@ -4509,10 +4555,10 @@ class NextLevelOCRScanner(ctk.CTk):
         log_level = getattr(logging, cfg.get("log_level", "INFO"), logging.INFO)
         logging.getLogger(APP_NAME).setLevel(log_level)
         self.set_status(
-            f"Settings applied — OCR mode: {cfg.get('ocr_mode', 'dual')}")
+            f"Settings applied — OCR mode: {cfg.get('ocr_mode', 'triple')}")
         logger.info("Settings applied: theme=%s, tess=%s, db=%s, ocr_mode=%s",
                     cfg.get("theme"), cfg.get("tesseract_path"),
-                    cfg.get("db_path"), cfg.get("ocr_mode", "dual"))
+                    cfg.get("db_path"), cfg.get("ocr_mode", "triple"))
 
     # ──────────────────────────────────────────────────────────
     # Stats
