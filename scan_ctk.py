@@ -42,8 +42,20 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "4.0.5"
+APP_VERSION = "4.0.6"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
+# Changelog v4.0.6:
+#   - Feature: Area-selection tool — drag a rectangle on the preview canvas to define
+#     a region of interest; new "🔲 Scan Region" button OCRs only the selected crop
+#   - Feature: "✂ Select" toggle button in the preview toolbar to enter/exit selection mode
+#   - Feature: "✕ Clear" button to dismiss the selection overlay
+#   - Feature: Selection coordinates shown in the status bar while dragging
+#   - Feature: Keyboard shortcut Ctrl+X — scan selected region (mirror of START SCAN)
+#   - Feature: Escape key — clear the active selection
+#   - Enhancement: Selection rectangle rendered as a dashed overlay on the canvas;
+#     persists across zoom/re-renders until cleared or a new image is loaded
+#   - Enhancement: Rotation and new-image loads automatically clear any active selection
+
 # Changelog v4.0.5:
 #   - Fix: missing app.mainloop() at entry point (app would exit immediately on some platforms)
 #   - Fix: deprecated Image.BICUBIC → Image.Resampling.BICUBIC in preprocess_for_paddleocr
@@ -95,6 +107,13 @@ _MAX_ZOOM = 8.0
 # Fallback preview panel dimensions (pixels) used when the widget has not yet been rendered
 _DEFAULT_PREVIEW_W = 780
 _DEFAULT_PREVIEW_H = 860
+
+# v4.0.6: minimum drag distance (canvas pixels) required to register a selection
+_MIN_SEL_PX = 4
+
+# v4.0.6: colours used to render the selection overlay
+_SEL_OUTLINE_COLOR = "#38BDF8"
+_SEL_FILL_COLOR    = "#38BDF820"
 
 # Sidebar thumbnail dimensions
 _THUMB_W = 68
@@ -2409,6 +2428,7 @@ class ShortcutsDialog(ctk.CTkToplevel):
     _SHORTCUTS = [
         ("Ctrl + O",       "Load directory"),
         ("Ctrl + S",       "Scan current image"),
+        ("Ctrl + X",       "Scan selected region  ✦ v4.0.6"),
         ("Ctrl + V",       "Paste image from clipboard"),
         ("Ctrl + B",       "Start batch scan  ✦ v4.0.1"),
         ("Ctrl + E",       "Export to CSV"),
@@ -2416,6 +2436,7 @@ class ShortcutsDialog(ctk.CTkToplevel):
         ("Ctrl + I",       "Show image info  ✦ v4.0.1"),
         ("Ctrl + T",       "Toggle Dark / Light theme  ✦ v4.0.5"),
         ("Ctrl + ?",       "Show this shortcuts dialog"),
+        ("Escape",         "Clear selection  ✦ v4.0.6"),
         ("← / →",          "Previous / Next image"),
         ("↑ / ↓",          "Previous / Next image (alternative)"),
         ("R",              "Rotate image 90° clockwise"),
@@ -2567,6 +2588,13 @@ class NextLevelOCRScanner(ctk.CTk):
         self._canvas_orig_size           = (0, 0)
         self._preview_canvas_img         = None    # keep PhotoImage reference
         self._tooltip_window: tk.Toplevel | None = None
+
+        # v4.0.6: area-selection state for cropped OCR
+        self._select_mode: bool              = False   # True = selection drag mode
+        self._sel_start: tuple | None        = None    # (cx, cy) drag-start in canvas coords
+        self._sel_end: tuple | None          = None    # (cx, cy) drag-end in canvas coords
+        self._sel_image_box: tuple | None    = None    # (x1,y1,x2,y2) in image pixel coords
+        self._sel_canvas_rect_id: int | None = None    # canvas rectangle item ID
 
         # ── Layout ─────────────────────────────────────────────
         self.grid_columnconfigure(0, weight=1)
@@ -2778,6 +2806,21 @@ class NextLevelOCRScanner(ctk.CTk):
                       fg_color="#065F46", hover_color="#047857",
                       command=self._deskew_current).pack(side='left', padx=2)
 
+        # v4.0.6: area-selection mode toggle
+        self._sel_btn = ctk.CTkButton(
+            tb2, text="✂ Select", width=76,
+            fg_color="#374151", hover_color="#1F2937",
+            command=self._toggle_select_mode)
+        self._sel_btn.pack(side='left', padx=2)
+
+        # v4.0.6: clear active selection
+        self._sel_clear_btn = ctk.CTkButton(
+            tb2, text="✕ Clear Sel", width=84,
+            fg_color="#7F1D1D", hover_color="#991B1B",
+            command=self._clear_selection)
+        self._sel_clear_btn.pack(side='left', padx=2)
+        self._sel_clear_btn.configure(state="disabled")
+
         # Box-source selector (EasyOCR / PaddleOCR / Tesseract / Both)
         self._box_source_var = ctk.StringVar(value="both")
         ctk.CTkOptionMenu(
@@ -2816,7 +2859,9 @@ class NextLevelOCRScanner(ctk.CTk):
         self._preview_canvas.bind("<MouseWheel>", self._on_canvas_scroll)   # Win/Mac
         self._preview_canvas.bind("<Button-4>",   self._on_canvas_scroll)   # Linux up
         self._preview_canvas.bind("<Button-5>",   self._on_canvas_scroll)   # Linux down
-        self._preview_canvas.bind("<Button-1>",   self._on_canvas_click)
+        self._preview_canvas.bind("<ButtonPress-1>",   self._on_canvas_press)
+        self._preview_canvas.bind("<B1-Motion>",        self._on_canvas_drag)
+        self._preview_canvas.bind("<ButtonRelease-1>",  self._on_canvas_release)
         self._preview_canvas.bind("<Motion>",     self._on_canvas_hover)
         self._preview_canvas.bind("<Leave>",      self._on_canvas_leave)
         # v4.0.3: re-render image when the canvas is resized (debounced 50 ms)
@@ -2956,7 +3001,16 @@ class NextLevelOCRScanner(ctk.CTk):
             font=ctk.CTkFont(size=15, weight="bold"),
             height=48, fg_color="#10B981", hover_color="#059669",
             corner_radius=8, command=self.start_scan_thread)
-        self.btn_scan.grid(row=6, column=0, sticky="ew", padx=16, pady=(8, 16))
+        self.btn_scan.grid(row=6, column=0, sticky="ew", padx=16, pady=(8, 4))
+
+        # v4.0.6: Scan selected region button
+        self._btn_scan_region = ctk.CTkButton(
+            self.results_frame, text="🔲 Scan Region  (Ctrl+X)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            height=38, fg_color="#1D4ED8", hover_color="#1E40AF",
+            corner_radius=8, state="disabled",
+            command=self.start_scan_selection)
+        self._btn_scan_region.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 16))
 
     def _build_statusbar(self):
         self._status_bar = ctk.CTkFrame(self, height=28, corner_radius=0,
@@ -3021,6 +3075,11 @@ class NextLevelOCRScanner(ctk.CTk):
         # v4.0.5: Ctrl+T — quick theme toggle (Dark ↔ Light)
         self.bind("<Control-t>", lambda e: self._toggle_theme())
         self.bind("<Control-T>", lambda e: self._toggle_theme())
+
+        # v4.0.6: Ctrl+X — scan selected region; Escape — clear selection
+        self.bind("<Control-x>", lambda e: self.start_scan_selection())
+        self.bind("<Control-X>", lambda e: self.start_scan_selection())
+        self.bind("<Escape>",    lambda e: self._clear_selection())
 
         # Image navigation
         self.bind("<Left>",  lambda e: self._navigate(-1))
@@ -3238,10 +3297,13 @@ class NextLevelOCRScanner(ctk.CTk):
         for p, btn in self.file_buttons.items():
             is_active = (p == path)
             btn.configure(fg_color="#1E3A5F" if is_active else "transparent")
-        # Clear previous OCR boxes when a new image is loaded
+        # Clear previous OCR boxes and selection when a new image is loaded
         self._ocr_boxes_easy   = []
         self._ocr_boxes_tess   = []
         self._ocr_boxes_paddle = []
+        self._sel_image_box    = None
+        self._sel_start        = None
+        self._sel_end          = None
         try:
             self._base_pil_img = Image.open(path)
             self._zoom_factor  = 1.0
@@ -3324,6 +3386,10 @@ class NextLevelOCRScanner(ctk.CTk):
         if self._show_boxes:
             self._draw_boxes_on_canvas(hit_only=True)
 
+        # v4.0.6: redraw the selection rectangle overlay if one is active
+        if self._sel_image_box is not None:
+            self._draw_selection_rect()
+
         # Update zoom percentage label
         zoom_pct = int(self._zoom_factor * 100)
         try:
@@ -3360,10 +3426,13 @@ class NextLevelOCRScanner(ctk.CTk):
         if self._base_pil_img is None:
             return
         self._rotation_angle = (self._rotation_angle + angle) % 360
-        # Clear bounding boxes since they no longer match the rotated view
+        # Clear bounding boxes and selection since they no longer match the rotated view
         self._ocr_boxes_easy   = []
         self._ocr_boxes_tess   = []
         self._ocr_boxes_paddle = []
+        self._sel_image_box    = None
+        self._sel_start        = None
+        self._sel_end          = None
         self._render_image()
         self.set_status(f"🔄 Rotated {self._rotation_angle}°")
 
@@ -3729,16 +3798,88 @@ class NextLevelOCRScanner(ctk.CTk):
             self.after_cancel(self._render_debounce_id)
         self._render_debounce_id = self.after(50, self._render_image)
 
-    def _on_canvas_click(self, event):
-        """Click on canvas background (not on a box) — show pixel info."""
-        ox, oy = self._canvas_img_offset
-        dw, dh = self._canvas_display_size
+    def _on_canvas_press(self, event):
+        """Mouse button-1 press: start a selection drag (select mode) or show pixel info."""
+        if self._select_mode:
+            self._sel_start = (event.x, event.y)
+            self._sel_end   = (event.x, event.y)
+            # Remove any previous live selection rect from the canvas
+            if self._sel_canvas_rect_id is not None:
+                try:
+                    self._preview_canvas.delete(self._sel_canvas_rect_id)
+                except Exception:
+                    pass
+                self._sel_canvas_rect_id = None
+        else:
+            # Normal mode: show image-coordinate readout in the status bar
+            ox, oy = self._canvas_img_offset
+            dw, dh = self._canvas_display_size
+            ow, oh = self._canvas_orig_size
+            if dw and dh and ow and oh:
+                px = int((event.x - ox) * ow / dw)
+                py = int((event.y - oy) * oh / dh)
+                if 0 <= px < ow and 0 <= py < oh:
+                    self.set_status(f"📍 Image coords: ({px}, {py})")
+
+    def _on_canvas_drag(self, event):
+        """Mouse B1-Motion: update the live selection rectangle while dragging."""
+        if not self._select_mode or self._sel_start is None:
+            return
+        self._sel_end = (event.x, event.y)
+        # Redraw the live selection rectangle on the canvas
+        x1 = min(self._sel_start[0], event.x)
+        y1 = min(self._sel_start[1], event.y)
+        x2 = max(self._sel_start[0], event.x)
+        y2 = max(self._sel_start[1], event.y)
+        if self._sel_canvas_rect_id is not None:
+            try:
+                self._preview_canvas.delete(self._sel_canvas_rect_id)
+            except Exception:
+                pass
+        self._sel_canvas_rect_id = self._preview_canvas.create_rectangle(
+            x1, y1, x2, y2,
+            outline=_SEL_OUTLINE_COLOR, width=2, dash=(6, 3), tags="sel_rect")
+        # Show dimensions hint in status bar
+        ix1, iy1 = self._canvas_to_image_coord(x1, y1)
+        ix2, iy2 = self._canvas_to_image_coord(x2, y2)
+        w = max(0, ix2 - ix1)
+        h = max(0, iy2 - iy1)
+        self.set_status(f"✂ Selection: ({ix1}, {iy1}) → ({ix2}, {iy2})  [{w}×{h} px]")
+
+    def _on_canvas_release(self, event):
+        """Mouse B1-Release: finalise the selection region."""
+        if not self._select_mode or self._sel_start is None:
+            return
+        self._sel_end = (event.x, event.y)
+        sx1 = min(self._sel_start[0], event.x)
+        sy1 = min(self._sel_start[1], event.y)
+        sx2 = max(self._sel_start[0], event.x)
+        sy2 = max(self._sel_start[1], event.y)
+        # Ignore tiny accidental clicks (< _MIN_SEL_PX px)
+        if (sx2 - sx1) < _MIN_SEL_PX or (sy2 - sy1) < _MIN_SEL_PX:
+            self._sel_start = None
+            return
+        # Convert to image coordinates and clamp
+        ix1, iy1 = self._canvas_to_image_coord(sx1, sy1)
+        ix2, iy2 = self._canvas_to_image_coord(sx2, sy2)
         ow, oh = self._canvas_orig_size
-        if dw and dh and ow and oh:
-            px = int((event.x - ox) * ow / dw)
-            py = int((event.y - oy) * oh / dh)
-            if 0 <= px < ow and 0 <= py < oh:
-                self.set_status(f"📍 Image coords: ({px}, {py})")
+        ix1 = max(0, min(ix1, ow))
+        iy1 = max(0, min(iy1, oh))
+        ix2 = max(0, min(ix2, ow))
+        iy2 = max(0, min(iy2, oh))
+        self._sel_image_box = (ix1, iy1, ix2, iy2)
+        # Persist the rectangle via _draw_selection_rect (rendered by _render_image)
+        self._render_image()
+        try:
+            self._sel_clear_btn.configure(state="normal")
+            self._btn_scan_region.configure(state="normal")
+        except Exception:
+            pass
+        w = ix2 - ix1
+        h = iy2 - iy1
+        self.set_status(
+            f"✂ Region selected: ({ix1}, {iy1}) → ({ix2}, {iy2})  [{w}×{h} px]  "
+            f"— click '🔲 Scan Region' or press Ctrl+X to OCR it")
 
     def _on_canvas_hover(self, _event):
         """Placeholder — per-box hover is handled by tag_bind."""
@@ -3790,6 +3931,136 @@ class NextLevelOCRScanner(ctk.CTk):
             except Exception:
                 pass
             self._tooltip_window = None
+
+    # ──────────────────────────────────────────────────────────
+    # v4.0.6 — Area selection helpers
+    # ──────────────────────────────────────────────────────────
+
+    def _canvas_to_image_coord(self, cx: float, cy: float) -> tuple:
+        """Convert a canvas pixel coordinate to the corresponding original-image pixel."""
+        ox, oy = self._canvas_img_offset
+        dw, dh = self._canvas_display_size
+        ow, oh = self._canvas_orig_size
+        if dw == 0 or dh == 0:
+            return (0, 0)
+        ix = int((cx - ox) * ow / dw)
+        iy = int((cy - oy) * oh / dh)
+        return (ix, iy)
+
+    def _image_to_canvas_coord(self, ix: float, iy: float) -> tuple:
+        """Convert an image pixel coordinate back to a canvas coordinate."""
+        ox, oy = self._canvas_img_offset
+        dw, dh = self._canvas_display_size
+        ow, oh = self._canvas_orig_size
+        if ow == 0 or oh == 0:
+            return (0, 0)
+        cx = ox + ix * dw / ow
+        cy = oy + iy * dh / oh
+        return (cx, cy)
+
+    def _draw_selection_rect(self):
+        """Draw the persisted selection rectangle on the preview canvas."""
+        if self._sel_image_box is None:
+            return
+        ix1, iy1, ix2, iy2 = self._sel_image_box
+        cx1, cy1 = self._image_to_canvas_coord(ix1, iy1)
+        cx2, cy2 = self._image_to_canvas_coord(ix2, iy2)
+        # Shaded fill to mark the selected region
+        self._preview_canvas.create_rectangle(
+            cx1, cy1, cx2, cy2,
+            outline=_SEL_OUTLINE_COLOR, width=2, dash=(6, 3),
+            fill=_SEL_FILL_COLOR, tags="sel_rect")
+        # Corner-label with pixel dimensions
+        w = ix2 - ix1
+        h = iy2 - iy1
+        self._preview_canvas.create_text(
+            cx1 + 4, cy1 + 4,
+            text=f" {w}×{h} px ",
+            fill=_SEL_OUTLINE_COLOR, font=("Consolas", 8),
+            anchor="nw", tags="sel_rect_label")
+
+    def _toggle_select_mode(self):
+        """Toggle between selection mode and normal (click) mode."""
+        self._select_mode = not self._select_mode
+        if self._select_mode:
+            self._sel_btn.configure(fg_color="#1D4ED8", hover_color="#1E40AF",
+                                    text="✂ Select ON")
+            self._preview_canvas.configure(cursor="crosshair")
+            self.set_status("✂ Selection mode ON — drag to select a region for OCR")
+        else:
+            self._sel_btn.configure(fg_color="#374151", hover_color="#1F2937",
+                                    text="✂ Select")
+            self._preview_canvas.configure(cursor="")
+            self.set_status("✂ Selection mode OFF")
+
+    def _clear_selection(self):
+        """Clear the active selection rectangle."""
+        self._sel_image_box = None
+        self._sel_start     = None
+        self._sel_end       = None
+        if self._sel_canvas_rect_id is not None:
+            try:
+                self._preview_canvas.delete(self._sel_canvas_rect_id)
+            except Exception:
+                pass
+            self._sel_canvas_rect_id = None
+        try:
+            self._sel_clear_btn.configure(state="disabled")
+            self._btn_scan_region.configure(state="disabled")
+        except Exception:
+            pass
+        self._render_image()
+        self.set_status("✂ Selection cleared")
+
+    def start_scan_selection(self):
+        """Crop the preview image to the selected region and run OCR on it."""
+        if self._sel_image_box is None:
+            self.set_status("⚠️  No region selected. Use '✂ Select' then drag.")
+            return
+        if not self.current_image_path:
+            self.set_status("⚠️  No image loaded.")
+            return
+        if self._batch_running:
+            self.set_status("⚠️  Batch scan in progress. Please wait.")
+            return
+        if not self._scan_lock.acquire(blocking=False):
+            return
+
+        # Build the cropped PIL image from the (possibly rotated) base image
+        try:
+            img = self._base_pil_img.copy()
+            if self._rotation_angle % 360 != 0:
+                img = img.rotate(-self._rotation_angle, expand=True)
+            x1, y1, x2, y2 = self._sel_image_box
+            crop = img.crop((x1, y1, x2, y2))
+        except Exception as exc:
+            self._scan_lock.release()
+            self.set_status(f"⚠️  Could not crop selection: {exc}")
+            return
+
+        self.btn_scan.configure(state="disabled", text="⏳ SCANNING…")
+        try:
+            self._btn_scan_region.configure(state="disabled")
+        except Exception:
+            pass
+        self.progress_bar.start()
+        region_label = (f"region ({x1},{y1})→({x2},{y2}), "
+                        f"{x2-x1}×{y2-y1} px")
+        self.update_textbox(self.smart_data_box,
+                            f"🔬 Running Triple-Engine OCR on selected region…\n\n"
+                            f"• Region: {region_label}\n"
+                            f"• Tesseract LSTM\n"
+                            f"• EasyOCR CRNN\n"
+                            f"• PaddleOCR\n\n"
+                            "First run: neural engines may take ~1–2 min to load models…")
+        self.update_textbox(self.raw_data_box, "⚙️  Processing region…")
+        self.set_status(f"Scanning region: {region_label}")
+        t = threading.Thread(
+            target=self._run_single_scan,
+            args=(self.current_image_path,),
+            kwargs={"pil_override": crop},
+            daemon=True)
+        t.start()
 
     # ──────────────────────────────────────────────────────────
     # Box-overlay controls
@@ -3877,12 +4148,13 @@ class NextLevelOCRScanner(ctk.CTk):
                               args=(self.current_image_path,), daemon=True)
         t.start()
 
-    def _run_single_scan(self, image_path: str):
+    def _run_single_scan(self, image_path: str, pil_override: Image.Image | None = None):
         t0 = time.time()
         try:
             auto_deskew = _config.get("auto_deskew", False)
             ocr_mode    = _config.get("ocr_mode", "triple")
-            original_img  = Image.open(image_path)
+            # v4.0.6: use provided crop/override instead of the full file when set
+            original_img  = pil_override if pil_override is not None else Image.open(image_path)
             img_tess      = preprocess_image(original_img, auto_deskew=auto_deskew)
             img_easy      = preprocess_for_easyocr(original_img, auto_deskew=auto_deskew)
             img_paddle    = preprocess_for_paddleocr(original_img, auto_deskew=auto_deskew)
@@ -4055,6 +4327,12 @@ class NextLevelOCRScanner(ctk.CTk):
         self.progress_bar.set(0)
         self.btn_scan.configure(state="normal", text="▶  START SCAN  (Ctrl+S)")
         self._scan_lock.release()
+        # v4.0.6: restore Scan Region button state based on whether selection is active
+        try:
+            region_state = "normal" if self._sel_image_box is not None else "disabled"
+            self._btn_scan_region.configure(state=region_state)
+        except Exception:
+            pass
         self._refresh_stats_label()
         self._refresh_today_label()
         fields_n = len(metadata) if metadata else 0
