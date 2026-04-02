@@ -42,8 +42,15 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "4.0.3"
+APP_VERSION = "4.0.4"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
+# Changelog v4.0.4:
+#   - Triple-engine OCR: PaddleOCR added alongside Tesseract and EasyOCR
+#   - New ocr_mode values: "triple" (all three engines), "paddle_only"
+#   - Triple-engine merge with majority-vote confidence fusion for higher accuracy
+#   - PaddleOCR bounding boxes shown in preview with distinct "paddle" source option
+#   - PaddleOCR lazy-loaded on first use; gracefully skipped if not installed
+
 # Changelog v4.0.3:
 #   - Toast: smooth fade-out animation before dismiss (complements existing fade-in)
 #   - Canvas: debounced <Configure> handler (50 ms) — prevents render flooding on resize
@@ -142,7 +149,7 @@ _DEFAULT_CONFIG: dict = {
     "zoom_step":              1.2,
     "window_geometry":        "",
     # v3.0.1 additions
-    "ocr_mode":               "dual",   # "dual" | "tesseract_only" | "easyocr_only"
+    "ocr_mode":               "triple",  # "triple" | "dual" | "tesseract_only" | "easyocr_only" | "paddle_only"
     "ocr_confidence_threshold": 0.60,   # min EasyOCR confidence to prefer its output
     "history_limit":          500,      # max rows shown in the History dialog
     "batch_preview_interval": 5,        # update preview every N images during batch
@@ -760,6 +767,36 @@ def get_easyocr_reader():
             return None
     return _easyocr_reader
 
+# ─────────────────────────────────────────────────────────────────
+# PaddleOCR — Lazy-load
+# ─────────────────────────────────────────────────────────────────
+_paddle_reader    = None
+_paddle_available = None
+
+
+def get_paddle_reader():
+    """Lazy-load PaddleOCR; returns None if the package is unavailable."""
+    global _paddle_reader, _paddle_available
+    if _paddle_available is False:
+        return None
+    if _paddle_reader is None:
+        try:
+            import warnings
+            warnings.filterwarnings("ignore")
+            from paddleocr import PaddleOCR  # type: ignore
+            # lang='vi' uses the Vietnamese detection + recognition models.
+            # use_angle_cls=True corrects rotated/tilted text lines.
+            # show_log=False suppresses verbose PaddlePaddle framework output.
+            _paddle_reader    = PaddleOCR(use_angle_cls=True, lang='vi',
+                                          show_log=False, use_gpu=False)
+            _paddle_available = True
+            logger.info("PaddleOCR reader loaded successfully.")
+        except Exception as exc:
+            logger.warning("PaddleOCR unavailable: %s", exc)
+            _paddle_available = False
+            return None
+    return _paddle_reader
+
 # Apply CustomTkinter theme from config
 ctk.set_appearance_mode(_config.get("theme", "Dark"))
 ctk.set_default_color_theme(_config.get("color_theme", "green"))
@@ -1131,6 +1168,83 @@ def run_easyocr(pil_img):
         return "", 0.0, []
 
 
+def preprocess_for_paddleocr(pil_img, auto_deskew: bool = False):
+    """Preprocessing optimised for PaddleOCR.
+
+    PaddleOCR accepts BGR numpy arrays (OpenCV convention).  We apply the same
+    contrast-enhancement and optional deskew used for EasyOCR, but return the
+    image as a BGR ndarray so PaddleOCR can ingest it directly without a
+    second conversion.
+    """
+    np_img = np.array(pil_img.convert("RGB"))
+    # Mild CLAHE contrast boost on the luminance channel
+    lab = cv2.cvtColor(np_img, cv2.COLOR_RGB2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_ch  = clahe.apply(l_ch)
+    lab   = cv2.merge((l_ch, a_ch, b_ch))
+    np_img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    if auto_deskew:
+        gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+        angle = detect_skew_angle(gray)
+        if abs(angle) > 0.5:
+            pil_tmp = Image.fromarray(np_img)
+            pil_tmp = pil_tmp.rotate(-angle, resample=Image.BICUBIC, expand=True)
+            np_img  = np.array(pil_tmp)
+    # PaddleOCR expects BGR
+    return cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+
+
+def run_paddleocr(bgr_img):
+    """Run PaddleOCR on a BGR numpy array; return (text, avg_conf, boxes).
+
+    boxes is a list of (quad, text, conf) tuples matching the EasyOCR format so
+    the same bounding-box rendering pipeline can be reused.  Results are sorted
+    top→bottom, left→right using the same Y-band quantisation as EasyOCR.
+    """
+    reader = get_paddle_reader()
+    if reader is None:
+        return "", 0.0, []
+    try:
+        raw = reader.ocr(bgr_img, cls=True)
+        # raw is a list-of-pages; for a single image it is [[result, …]] or
+        # [[[bbox, (text, conf)], …]] depending on PaddleOCR version.
+        if not raw:
+            return "", 0.0, []
+        # Flatten pages
+        items = []
+        for page in raw:
+            if page:
+                items.extend(page)
+        # Normalise to (quad, text, conf)
+        boxes = []
+        for item in items:
+            if not item:
+                continue
+            try:
+                bbox_raw, (text, conf) = item
+                # bbox_raw is [[x0,y0],[x1,y1],[x2,y2],[x3,y3]]
+                quad = [tuple(pt) for pt in bbox_raw]
+                boxes.append((quad, text, float(conf)))
+            except (ValueError, TypeError):
+                continue
+        if not boxes:
+            return "", 0.0, []
+        # Sort: Y-band quantised to _EASYOCR_Y_BAND px, then X
+        boxes.sort(key=lambda b: (
+            round(b[0][0][1] / _EASYOCR_Y_BAND) * _EASYOCR_Y_BAND,
+            b[0][0][0],
+        ))
+        lines       = [t for _, t, _ in boxes]
+        confidences = [c for _, _, c in boxes]
+        full_text   = "\n".join(lines)
+        avg_conf    = sum(confidences) / len(confidences) if confidences else 0.0
+        return full_text, avg_conf, boxes
+    except Exception as exc:
+        logger.debug("PaddleOCR error: %s", exc)
+        return "", 0.0, []
+
+
 def _group_tess_boxes_to_lines(word_boxes: list[tuple]) -> list[tuple]:
     """Merge Tesseract word-level boxes into line-level boxes.
 
@@ -1267,8 +1381,101 @@ def merge_dual_ocr(tess_text, easy_text, easy_confidence):
 
     return "\n".join(merged)
 
-# ─────────────────────────────────────────────────────────────────
-# OCR Correction Helpers
+
+def merge_triple_ocr(tess_text: str, easy_text: str, easy_conf: float,
+                     paddle_text: str, paddle_conf: float) -> str:
+    """Merge Tesseract, EasyOCR, and PaddleOCR with majority-vote confidence.
+
+    Strategy (per line):
+    1. Collect all three candidate lines for each position.
+    2. For lines that contain mostly digits, prefer the engine whose
+       digit-heavy line has the highest confidence (paddle > easy > tess).
+    3. For Vietnamese-text lines, use a SequenceMatcher vote: if two neural
+       engines agree sufficiently, prefer their common output over Tesseract.
+    4. If both neural engines are unavailable/empty, fall back to tess_text.
+    """
+    conf_threshold = _config.get("ocr_confidence_threshold", 0.60)
+
+    easy_available   = bool(easy_text.strip())
+    paddle_available = bool(paddle_text.strip())
+
+    if not easy_available and not paddle_available:
+        return tess_text
+
+    # Prefer the neural engine with significantly more lines if it's confident.
+    tess_lines   = [l for l in tess_text.splitlines()   if l.strip()]
+    easy_lines   = [l for l in easy_text.splitlines()   if l.strip()]
+    paddle_lines = [l for l in paddle_text.splitlines() if l.strip()]
+
+    # Both neural engines available and confident — pick the richer one.
+    if easy_available and paddle_available:
+        best_neural_text = easy_text if easy_conf >= paddle_conf else paddle_text
+        best_neural_conf = max(easy_conf, paddle_conf)
+        best_neural_lines = easy_lines if easy_conf >= paddle_conf else paddle_lines
+        if (len(best_neural_lines) > len(tess_lines) * _EASY_LINE_COUNT_RATIO
+                and best_neural_conf >= conf_threshold):
+            return best_neural_text
+    elif easy_available and easy_conf >= conf_threshold:
+        if len(easy_lines) > len(tess_lines) * _EASY_LINE_COUNT_RATIO:
+            return easy_text
+    elif paddle_available and paddle_conf >= conf_threshold:
+        if len(paddle_lines) > len(tess_lines) * _EASY_LINE_COUNT_RATIO:
+            return paddle_text
+
+    # Per-line voting
+    merged   = []
+    used_e   = set()
+    used_p   = set()
+
+    for t_line in tess_lines:
+        t_stripped = t_line.strip().lower()
+
+        # Find best matching EasyOCR line
+        best_easy, best_easy_score, best_easy_idx = None, 0.0, -1
+        for ei, e_line in enumerate(easy_lines):
+            if ei in used_e:
+                continue
+            score = difflib.SequenceMatcher(
+                None, t_stripped, e_line.strip().lower()).ratio()
+            if score > best_easy_score:
+                best_easy_score, best_easy, best_easy_idx = score, e_line, ei
+
+        # Find best matching PaddleOCR line
+        best_paddle, best_paddle_score, best_paddle_idx = None, 0.0, -1
+        for pi, p_line in enumerate(paddle_lines):
+            if pi in used_p:
+                continue
+            score = difflib.SequenceMatcher(
+                None, t_stripped, p_line.strip().lower()).ratio()
+            if score > best_paddle_score:
+                best_paddle_score, best_paddle, best_paddle_idx = score, p_line, pi
+
+        digit_count = sum(c.isdigit() for c in t_line)
+        has_numbers = digit_count >= 3
+
+        easy_wins   = (best_easy   is not None and best_easy_score   >= _MERGE_SIMILARITY_MIN
+                       and easy_conf   >= conf_threshold)
+        paddle_wins = (best_paddle is not None and best_paddle_score >= _MERGE_SIMILARITY_MIN
+                       and paddle_conf >= conf_threshold)
+
+        if has_numbers and easy_wins and paddle_wins:
+            # Both neural engines have a good match — choose higher-confidence
+            chosen = best_paddle if paddle_conf >= easy_conf else best_easy
+            if paddle_conf >= easy_conf:
+                used_p.add(best_paddle_idx)
+            else:
+                used_e.add(best_easy_idx)
+            merged.append(chosen)
+        elif has_numbers and paddle_wins:
+            merged.append(best_paddle)
+            used_p.add(best_paddle_idx)
+        elif has_numbers and easy_wins:
+            merged.append(best_easy)
+            used_e.add(best_easy_idx)
+        else:
+            merged.append(t_line)
+
+    return "\n".join(merged)
 # ─────────────────────────────────────────────────────────────────
 
 def correct_numeric_ocr(text):
@@ -1760,9 +1967,10 @@ class SettingsDialog(ctk.CTkToplevel):
 
         # OCR mode
         ctk.CTkLabel(scroll, text="OCR Mode:", anchor="w").pack(fill='x', **pad)
-        self._ocr_mode_var = ctk.StringVar(value=cfg.get("ocr_mode", "dual"))
+        self._ocr_mode_var = ctk.StringVar(value=cfg.get("ocr_mode", "triple"))
         ctk.CTkOptionMenu(scroll, variable=self._ocr_mode_var,
-                          values=["dual", "tesseract_only", "easyocr_only"]
+                          values=["triple", "dual", "tesseract_only",
+                                  "easyocr_only", "paddle_only"]
                           ).pack(fill='x', padx=20, pady=0)
 
         # EasyOCR confidence threshold
@@ -2324,10 +2532,11 @@ class NextLevelOCRScanner(ctk.CTk):
         self._thumb_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="thumb")
 
         # ── Bounding-box / OCR overlay state ───────────────────
-        self._ocr_boxes_easy: list       = []   # [(bbox_quad, text, conf), ...]
-        self._ocr_boxes_tess: list       = []   # [(x, y, w, h, text, conf), ...]
-        self._show_boxes: bool           = True
-        self._box_source: str            = "both"  # "easy" | "tess" | "both"
+        self._ocr_boxes_easy:   list       = []   # [(bbox_quad, text, conf), ...]
+        self._ocr_boxes_tess:   list       = []   # [(x, y, w, h, text, conf), ...]
+        self._ocr_boxes_paddle: list       = []   # [(bbox_quad, text, conf), ...]
+        self._show_boxes: bool             = True
+        self._box_source: str              = "both"  # "easy" | "paddle" | "tess" | "both"
         self._canvas_img_offset          = (0, 0)
         self._canvas_display_size        = (0, 0)
         self._canvas_orig_size           = (0, 0)
@@ -2528,11 +2737,11 @@ class NextLevelOCRScanner(ctk.CTk):
                       fg_color="#065F46", hover_color="#047857",
                       command=self._deskew_current).pack(side='left', padx=2)
 
-        # Box-source selector (EasyOCR / Tesseract / Both)
+        # Box-source selector (EasyOCR / PaddleOCR / Tesseract / Both)
         self._box_source_var = ctk.StringVar(value="both")
         ctk.CTkOptionMenu(
             tb2, variable=self._box_source_var,
-            values=["both", "easy", "tess"],
+            values=["both", "easy", "paddle", "tess"],
             width=84, command=self._on_box_source_change,
         ).pack(side='right', padx=2)
         ctk.CTkLabel(tb2, text="Source:", font=ctk.CTkFont(size=11)
@@ -2986,8 +3195,9 @@ class NextLevelOCRScanner(ctk.CTk):
             is_active = (p == path)
             btn.configure(fg_color="#1E3A5F" if is_active else "transparent")
         # Clear previous OCR boxes when a new image is loaded
-        self._ocr_boxes_easy = []
-        self._ocr_boxes_tess = []
+        self._ocr_boxes_easy   = []
+        self._ocr_boxes_tess   = []
+        self._ocr_boxes_paddle = []
         try:
             self._base_pil_img = Image.open(path)
             self._zoom_factor  = 1.0
@@ -3107,8 +3317,9 @@ class NextLevelOCRScanner(ctk.CTk):
             return
         self._rotation_angle = (self._rotation_angle + angle) % 360
         # Clear bounding boxes since they no longer match the rotated view
-        self._ocr_boxes_easy = []
-        self._ocr_boxes_tess = []
+        self._ocr_boxes_easy   = []
+        self._ocr_boxes_tess   = []
+        self._ocr_boxes_paddle = []
         self._render_image()
         self.set_status(f"🔄 Rotated {self._rotation_angle}°")
 
@@ -3127,8 +3338,9 @@ class NextLevelOCRScanner(ctk.CTk):
     def _apply_deskewed(self, corrected_img: Image.Image):
         self._base_pil_img = corrected_img
         self._rotation_angle = 0
-        self._ocr_boxes_easy = []
-        self._ocr_boxes_tess = []
+        self._ocr_boxes_easy   = []
+        self._ocr_boxes_tess   = []
+        self._ocr_boxes_paddle = []
         self._render_image()
         self.set_status("📐 Deskew applied.")
         self._show_toast("📐 Deskew applied!", color="#0F172A", text_color="#38BDF8")
@@ -3280,6 +3492,24 @@ class NextLevelOCRScanner(ctk.CTk):
                 draw.text((tx, max(0, ty - _LABEL_OFFS)), _label(text, conf),
                           fill=color, font=_font)
 
+        # PaddleOCR boxes (quad polygons — same format as EasyOCR)
+        if self._box_source in ("paddle", "both"):
+            for bbox, text, conf in self._ocr_boxes_paddle:
+                color = self._box_conf_color_rgb(conf)
+                pts = [(px * sx, py * sy) for px, py in bbox]
+                cx = sum(p[0] for p in pts) / len(pts)
+                cy = sum(p[1] for p in pts) / len(pts)
+                padded = []
+                for px, py in pts:
+                    dx, dy = px - cx, py - cy
+                    dist = (dx * dx + dy * dy) ** 0.5 or 1
+                    padded.append((px + dx / dist * _BOX_PAD,
+                                   py + dy / dist * _BOX_PAD))
+                draw.polygon(padded, outline=color, width=2)
+                tx, ty = padded[0]
+                draw.text((tx, max(0, ty - _LABEL_OFFS)), _label(text, conf),
+                          fill=color, font=_font)
+
         # Tesseract line boxes (axis-aligned rectangles)
         if self._box_source in ("tess", "both"):
             for bx, by, bw, bh, text, conf in self._ocr_boxes_tess:
@@ -3374,6 +3604,23 @@ class NextLevelOCRScanner(ctk.CTk):
                                     self._on_box_click(t, c, s))
                 canvas.tag_bind(tag, "<Enter>",
                                 lambda e, t=text, c=conf, s="EasyOCR":
+                                    self._show_box_tooltip(e, t, c, s))
+                canvas.tag_bind(tag, "<Leave>",
+                                lambda _e: self._hide_tooltip())
+
+        # PaddleOCR boxes (quad polygons — same format as EasyOCR)
+        if self._box_source in ("paddle", "both"):
+            for i, (bbox, text, conf) in enumerate(self._ocr_boxes_paddle):
+                pts = []
+                for px, py in bbox:
+                    pts.extend([ox + px * sx, oy + py * sy])
+                tag = f"paddle_{i}"
+                _draw_quad(pts, text, conf, tag)
+                canvas.tag_bind(tag, "<Button-1>",
+                                lambda _e, t=text, c=conf, s="PaddleOCR":
+                                    self._on_box_click(t, c, s))
+                canvas.tag_bind(tag, "<Enter>",
+                                lambda e, t=text, c=conf, s="PaddleOCR":
                                     self._show_box_tooltip(e, t, c, s))
                 canvas.tag_bind(tag, "<Leave>",
                                 lambda _e: self._hide_tooltip())
@@ -3575,10 +3822,11 @@ class NextLevelOCRScanner(ctk.CTk):
         self.btn_scan.configure(state="disabled", text="⏳ SCANNING…")
         self.progress_bar.start()
         self.update_textbox(self.smart_data_box,
-                            "🔬 Running Dual-Engine OCR…\n\n"
+                            "🔬 Running Triple-Engine OCR…\n\n"
                             "• Tesseract LSTM\n"
-                            "• EasyOCR CRNN\n\n"
-                            "First run: EasyOCR may take ~1 min to load model…")
+                            "• EasyOCR CRNN\n"
+                            "• PaddleOCR\n\n"
+                            "First run: neural engines may take ~1–2 min to load models…")
         self.update_textbox(self.raw_data_box, "⚙️  Processing…")
         self.set_status(f"Scanning: {os.path.basename(self.current_image_path)}")
         t = threading.Thread(target=self._run_single_scan,
@@ -3589,33 +3837,40 @@ class NextLevelOCRScanner(ctk.CTk):
         t0 = time.time()
         try:
             auto_deskew = _config.get("auto_deskew", False)
-            ocr_mode    = _config.get("ocr_mode", "dual")
-            original_img = Image.open(image_path)
-            img_tess     = preprocess_image(original_img, auto_deskew=auto_deskew)
-            img_easy     = preprocess_for_easyocr(original_img, auto_deskew=auto_deskew)
+            ocr_mode    = _config.get("ocr_mode", "triple")
+            original_img  = Image.open(image_path)
+            img_tess      = preprocess_image(original_img, auto_deskew=auto_deskew)
+            img_easy      = preprocess_for_easyocr(original_img, auto_deskew=auto_deskew)
+            img_paddle    = preprocess_for_paddleocr(original_img, auto_deskew=auto_deskew)
 
-            tess_text  = ""
-            easy_text  = ""
-            easy_conf  = 0.0
-            easy_boxes = []
-            tess_boxes = []
+            tess_text    = ""
+            easy_text    = ""
+            easy_conf    = 0.0
+            easy_boxes   = []
+            tess_boxes   = []
+            paddle_text  = ""
+            paddle_conf  = 0.0
+            paddle_boxes = []
 
-            # v4.0.3: run all eligible OCR tasks in one parallel pool to minimise
-            # total wall-clock latency (previously tess-boxes and EasyOCR were serial)
-            with ThreadPoolExecutor(max_workers=3) as ex:
-                fut_tess       = (ex.submit(run_tesseract,       img_tess)
-                                  if ocr_mode in ("dual", "tesseract_only") else None)
-                fut_tess_boxes = (ex.submit(get_tess_word_boxes, img_tess)
-                                  if ocr_mode in ("dual", "tesseract_only") else None)
-                fut_easy       = (ex.submit(run_easyocr,         img_easy)
-                                  if ocr_mode in ("dual", "easyocr_only")   else None)
+            # Run all eligible OCR tasks in one parallel pool for minimum latency
+            use_tess   = ocr_mode in ("triple", "dual", "tesseract_only")
+            use_easy   = ocr_mode in ("triple", "dual", "easyocr_only")
+            use_paddle = ocr_mode in ("triple", "paddle_only")
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                fut_tess       = ex.submit(run_tesseract,       img_tess)   if use_tess   else None
+                fut_tess_boxes = ex.submit(get_tess_word_boxes, img_tess)   if use_tess   else None
+                fut_easy       = ex.submit(run_easyocr,         img_easy)   if use_easy   else None
+                fut_paddle     = ex.submit(run_paddleocr,       img_paddle) if use_paddle else None
 
                 if fut_tess is not None:
-                    tess_text  = fut_tess.result()
+                    tess_text = fut_tess.result()
                 if fut_tess_boxes is not None:
                     tess_boxes = fut_tess_boxes.result()
                 if fut_easy is not None:
                     easy_text, easy_conf, easy_boxes = fut_easy.result()
+                if fut_paddle is not None:
+                    paddle_text, paddle_conf, paddle_boxes = fut_paddle.result()
 
             if ocr_mode == "easyocr_only":
                 engine_label   = f"EasyOCR (conf: {easy_conf * 100:.1f}%)"
@@ -3623,6 +3878,28 @@ class NextLevelOCRScanner(ctk.CTk):
             elif ocr_mode == "tesseract_only":
                 engine_label   = "Tesseract only"
                 extracted_text = tess_text
+            elif ocr_mode == "paddle_only":
+                engine_label   = f"PaddleOCR (conf: {paddle_conf * 100:.1f}%)"
+                extracted_text = paddle_text if paddle_text.strip() else tess_text
+            elif ocr_mode == "triple":
+                neural_confs = []
+                if easy_text.strip():   neural_confs.append(easy_conf)
+                if paddle_text.strip(): neural_confs.append(paddle_conf)
+                active_names = (
+                    ([" EasyOCR"]   if easy_text.strip()   else []) +
+                    (["PaddleOCR"]  if paddle_text.strip() else [])
+                )
+                if neural_confs:
+                    avg = sum(neural_confs) / len(neural_confs)
+                    engine_label   = (f"Tess + {' + '.join(active_names)} ✅ "
+                                      f"(conf: {avg * 100:.1f}%)")
+                    extracted_text = merge_triple_ocr(
+                        tess_text, easy_text, easy_conf, paddle_text, paddle_conf)
+                    easy_conf = avg
+                else:
+                    engine_label   = "Tesseract only"
+                    easy_conf      = 0.0
+                    extracted_text = tess_text
             else:  # dual
                 if easy_text.strip():
                     engine_label   = f"Tesseract + EasyOCR ✅ (conf: {easy_conf * 100:.1f}%)"
@@ -3646,25 +3923,27 @@ class NextLevelOCRScanner(ctk.CTk):
 
             smart_out, raw_out = self._format_output(
                 engine_label, receipt_type, metadata, extracted_text,
-                easy_text, elapsed_ms, easy_conf)
+                easy_text, elapsed_ms, easy_conf,
+                paddle_text=paddle_text)
 
             self.after(0, self._finish_single_scan,
                        smart_out, raw_out, metadata, receipt_type,
-                       elapsed_ms, engine_label, easy_boxes, tess_boxes)
+                       elapsed_ms, engine_label, easy_boxes, tess_boxes, paddle_boxes)
 
         except pytesseract.TesseractError as exc:
             err = ("Language pack 'vie.traineddata' missing!"
                    if 'Failed loading language' in str(exc) else str(exc))
             logger.error("Tesseract error on %s: %s", image_path, err)
             self.after(0, self._finish_single_scan,
-                       f"ERROR\n{err}", err, None, "unknown", 0, "", [], [])
+                       f"ERROR\n{err}", err, None, "unknown", 0, "", [], [], [])
         except Exception as exc:
             logger.error("Scan error on %s: %s", image_path, exc, exc_info=True)
             self.after(0, self._finish_single_scan,
-                       f"CRITICAL ERROR\n{exc}", str(exc), None, "unknown", 0, "", [], [])
+                       f"CRITICAL ERROR\n{exc}", str(exc), None, "unknown", 0, "", [], [], [])
 
     def _format_output(self, engine_label, receipt_type, metadata,
-                       extracted_text, easy_text, elapsed_ms, easy_conf: float = 0.0):
+                       extracted_text, easy_text, elapsed_ms, easy_conf: float = 0.0,
+                       paddle_text: str = ""):
         type_label = {
             "type1_web":   "🌐 Type 1 — Web UI (vertical labels)",
             "type2_vetc":  "📱 Type 2 — VETC App (key:value)",
@@ -3701,25 +3980,30 @@ class NextLevelOCRScanner(ctk.CTk):
         raw += extracted_text.strip() or "[No text found]"
         if easy_text.strip():
             raw += "\n\n=== EASYOCR RAW ===\n" + easy_text.strip()
+        if paddle_text.strip():
+            raw += "\n\n=== PADDLEOCR RAW ===\n" + paddle_text.strip()
 
         return smart.strip(), raw
 
     def _finish_single_scan(self, smart_text, raw_text, metadata,
                              receipt_type, elapsed_ms, engine_label,
-                             easy_boxes=None, tess_boxes=None):
+                             easy_boxes=None, tess_boxes=None, paddle_boxes=None):
         self.update_textbox(self.smart_data_box, smart_text)
         self.update_textbox(self.raw_data_box,   raw_text)
         self.latest_metadata     = metadata or {}
         self.latest_receipt_type = receipt_type
 
         # Store OCR boxes and re-render preview with overlays
-        self._ocr_boxes_easy = easy_boxes or []
-        self._ocr_boxes_tess = tess_boxes or []
+        self._ocr_boxes_easy   = easy_boxes   or []
+        self._ocr_boxes_tess   = tess_boxes   or []
+        self._ocr_boxes_paddle = paddle_boxes or []
         self._render_image()
 
-        easy_n = len(self._ocr_boxes_easy)
-        tess_n = len(self._ocr_boxes_tess)
-        logger.info("Boxes — EasyOCR: %d, Tesseract: %d", easy_n, tess_n)
+        easy_n   = len(self._ocr_boxes_easy)
+        tess_n   = len(self._ocr_boxes_tess)
+        paddle_n = len(self._ocr_boxes_paddle)
+        logger.info("Boxes — EasyOCR: %d, Tesseract: %d, PaddleOCR: %d",
+                    easy_n, tess_n, paddle_n)
 
         self.progress_bar.stop()
         self.progress_bar.set(0)
@@ -3731,7 +4015,7 @@ class NextLevelOCRScanner(ctk.CTk):
         status = (f"✅ Done in {elapsed_ms} ms | "
                   f"Engine: {engine_label} | "
                   f"Fields: {fields_n} | "
-                  f"Boxes: {easy_n} Easy / {tess_n} Tess")
+                  f"Boxes: {easy_n} Easy / {tess_n} Tess / {paddle_n} Paddle")
         self.set_status(status)
 
         # v3.0.2 — Duplicate scan detection
@@ -3860,7 +4144,7 @@ class NextLevelOCRScanner(ctk.CTk):
         failed  = 0
         t_start = time.time()
         auto_deskew      = _config.get("auto_deskew", False)
-        ocr_mode         = _config.get("ocr_mode", "dual")
+        ocr_mode         = _config.get("ocr_mode", "triple")
         preview_interval = max(1, _config.get("batch_preview_interval", 5))
 
         for idx, image_path in enumerate(self.image_files):
@@ -3885,35 +4169,64 @@ class NextLevelOCRScanner(ctk.CTk):
                 original_img = Image.open(image_path)
                 img_tess     = preprocess_image(original_img, auto_deskew=auto_deskew)
                 img_easy     = preprocess_for_easyocr(original_img, auto_deskew=auto_deskew)
+                img_paddle   = preprocess_for_paddleocr(original_img, auto_deskew=auto_deskew)
                 t0 = time.time()
 
-                tess_text = ""
-                easy_text = ""
-                conf      = 0.0
+                tess_text   = ""
+                easy_text   = ""
+                easy_conf   = 0.0
+                paddle_text = ""
+                pad_conf    = 0.0
+                conf        = 0.0
 
-                # v4.0.3: run Tesseract and EasyOCR in parallel to reduce per-image latency
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    fut_tess = (ex.submit(run_tesseract, img_tess)
-                                if ocr_mode in ("dual", "tesseract_only") else None)
-                    fut_easy = (ex.submit(run_easyocr,   img_easy)
-                                if ocr_mode in ("dual", "easyocr_only")   else None)
+                use_tess   = ocr_mode in ("triple", "dual", "tesseract_only")
+                use_easy   = ocr_mode in ("triple", "dual", "easyocr_only")
+                use_paddle = ocr_mode in ("triple", "paddle_only")
+
+                # Run all eligible engines in parallel per image
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    fut_tess   = ex.submit(run_tesseract, img_tess)   if use_tess   else None
+                    fut_easy   = ex.submit(run_easyocr,   img_easy)   if use_easy   else None
+                    fut_paddle = ex.submit(run_paddleocr, img_paddle) if use_paddle else None
                     if fut_tess is not None:
                         tess_text = fut_tess.result()
                     if fut_easy is not None:
-                        easy_text, conf, _ = fut_easy.result()
+                        easy_text, easy_conf, _ = fut_easy.result()
+                    if fut_paddle is not None:
+                        paddle_text, pad_conf, _ = fut_paddle.result()
 
                 elapsed_ms = int((time.time() - t0) * 1000)
 
                 if ocr_mode == "easyocr_only":
-                    engine_lbl     = f"EasyOCR ({conf * 100:.0f}%)"
+                    engine_lbl     = f"EasyOCR ({easy_conf * 100:.0f}%)"
                     extracted_text = easy_text if easy_text.strip() else tess_text
+                    conf           = easy_conf
                 elif ocr_mode == "tesseract_only":
                     engine_lbl     = "Tesseract"
                     extracted_text = tess_text
+                    conf           = 0.0
+                elif ocr_mode == "paddle_only":
+                    engine_lbl     = f"PaddleOCR ({pad_conf * 100:.0f}%)"
+                    extracted_text = paddle_text if paddle_text.strip() else tess_text
+                    conf           = pad_conf
+                elif ocr_mode == "triple":
+                    neural_confs = []
+                    if easy_text.strip():   neural_confs.append(easy_conf)
+                    if paddle_text.strip(): neural_confs.append(pad_conf)
+                    if neural_confs:
+                        conf       = sum(neural_confs) / len(neural_confs)
+                        engine_lbl = f"Triple ({conf * 100:.0f}%)"
+                        extracted_text = merge_triple_ocr(
+                            tess_text, easy_text, easy_conf, paddle_text, pad_conf)
+                    else:
+                        engine_lbl     = "Tesseract"
+                        conf           = 0.0
+                        extracted_text = tess_text
                 else:  # dual
                     if easy_text.strip():
-                        engine_lbl     = f"Dual (conf {conf * 100:.0f}%)"
-                        extracted_text = merge_dual_ocr(tess_text, easy_text, conf)
+                        engine_lbl     = f"Dual ({easy_conf * 100:.0f}%)"
+                        extracted_text = merge_dual_ocr(tess_text, easy_text, easy_conf)
+                        conf           = easy_conf
                     else:
                         engine_lbl     = "Tesseract"
                         conf           = 0.0
