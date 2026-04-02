@@ -2590,7 +2590,7 @@ class NextLevelOCRScanner(ctk.CTk):
         self._tooltip_window: tk.Toplevel | None = None
 
         # v4.0.6: area-selection state for cropped OCR
-        self._select_mode: bool              = False   # True = selection drag mode
+        self._select_mode: bool              = True    # True = selection drag mode
         self._sel_start: tuple | None        = None    # (cx, cy) drag-start in canvas coords
         self._sel_end: tuple | None          = None    # (cx, cy) drag-end in canvas coords
         self._sel_image_box: tuple | None    = None    # (x1,y1,x2,y2) in image pixel coords
@@ -2808,8 +2808,8 @@ class NextLevelOCRScanner(ctk.CTk):
 
         # v4.0.6: area-selection mode toggle
         self._sel_btn = ctk.CTkButton(
-            tb2, text="✂ Select", width=76,
-            fg_color="#374151", hover_color="#1F2937",
+            tb2, text="✂ Select ON", width=76,
+            fg_color="#1D4ED8", hover_color="#1E40AF",
             command=self._toggle_select_mode)
         self._sel_btn.pack(side='left', padx=2)
 
