@@ -113,7 +113,8 @@ _MIN_SEL_PX = 4
 
 # v4.0.6: colours used to render the selection overlay
 _SEL_OUTLINE_COLOR = "#38BDF8"
-_SEL_FILL_COLOR    = "#38BDF820"
+
+_SEL_FILL_COLOR    = None
 
 # Sidebar thumbnail dimensions
 _THUMB_W = 68
