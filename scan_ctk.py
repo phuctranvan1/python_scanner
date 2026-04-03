@@ -42,8 +42,22 @@ except ImportError:
 # App Metadata
 # ─────────────────────────────────────────────────────────────────
 APP_NAME    = "VETCScanner"
-APP_VERSION = "4.0.6"
+APP_VERSION = "4.0.7"
 APP_TITLE   = f"Toll Receipt OCR — VETC Enterprise v{APP_VERSION}"
+# Changelog v4.0.7:
+#   - Accuracy: unsharp_mask_image() — proper Gaussian unsharp masking replaces the
+#     basic Laplacian kernel in both bright and borderline preprocessing branches,
+#     giving crisper character edges without over-sharpening
+#   - Accuracy: apply_gamma_correction() — lifts deep shadows in very dark scans
+#     (mean brightness < 80) before CLAHE, recovering detail that CLAHE alone misses
+#   - Accuracy: remove_background_color() — converts saturated coloured backgrounds
+#     (e.g. VETC app green) to white before grayscale conversion so they become a
+#     clean white background rather than a mid-grey tone that confuses binarization
+#   - Accuracy: normalize_license_plate() — full Vietnamese plate normalizer that
+#     corrects OCR errors in each structural part of the plate (province code,
+#     series letter, serial number) instead of the previous 2-char numeric correction
+#   - All four functions are integrated into preprocess_image(), preprocess_for_easyocr(),
+#     and post_process_data() automatically; no settings changes required
 # Changelog v4.0.6:
 #   - Feature: Area-selection tool — drag a rectangle on the preview canvas to define
 #     a region of interest; new "🔲 Scan Region" button OCRs only the selected crop
@@ -942,6 +956,93 @@ def deskew_image(pil_img: Image.Image) -> Image.Image:
         return pil_img
 
 # ─────────────────────────────────────────────────────────────────
+# Preprocessing Utilities
+# ─────────────────────────────────────────────────────────────────
+
+def unsharp_mask_image(gray: np.ndarray, sigma: float = 1.0, strength: float = 1.5) -> np.ndarray:
+    """Apply unsharp masking to sharpen a grayscale image.
+
+    Unsharp masking subtracts a blurred copy of the image from the original,
+    amplifying high-frequency (edge) content.  This is more effective than a
+    Laplacian sharpening kernel because the Gaussian blur radius (*sigma*) and
+    blending *strength* can be tuned independently, avoiding the halo artefacts
+    common with fixed-kernel approaches.
+
+    Args:
+        gray:     Grayscale uint8 numpy array.
+        sigma:    Gaussian blur radius.  Larger values produce a softer mask.
+        strength: Blending weight for the high-pass layer.  1.5 is a moderate
+                  sharpening suitable for receipt text; 2.0+ is aggressive.
+
+    Returns:
+        Sharpened uint8 numpy array with the same shape as *gray*.
+    """
+    blurred = cv2.GaussianBlur(gray, (0, 0), sigma)
+    sharpened = cv2.addWeighted(gray, 1.0 + strength, blurred, -strength, 0)
+    return np.clip(sharpened, 0, 255).astype(np.uint8)
+
+
+def apply_gamma_correction(gray: np.ndarray, gamma: float) -> np.ndarray:
+    """Apply gamma correction to a grayscale image via a lookup table.
+
+    Gamma < 1.0 brightens the image (lifts shadows) which is useful for
+    underexposed scans where CLAHE alone cannot recover very dark regions.
+    Gamma > 1.0 darkens the image.  The lookup-table approach is faster
+    than a per-pixel power operation.
+
+    Args:
+        gray:  Grayscale uint8 numpy array.
+        gamma: Correction exponent (must be > 0).  Typical brightening value: 1.6 – 2.0.
+
+    Returns:
+        Gamma-corrected uint8 numpy array with the same shape as *gray*.
+    """
+    if gamma <= 0:
+        gamma = 1.0
+    inv_gamma = 1.0 / gamma
+    table = np.array(
+        [int((i / 255.0) ** inv_gamma * 255) for i in range(256)],
+        dtype=np.uint8,
+    )
+    return cv2.LUT(gray, table)
+
+
+def remove_background_color(img: Image.Image) -> Image.Image:
+    """Replace saturated (non-gray) background pixels with white.
+
+    VETC app screenshots often carry green, blue, or other coloured backgrounds.
+    Converting those high-brightness, high-saturation pixels to white before
+    grayscale conversion ensures they appear as a clean white background instead
+    of a mid-tone gray, which greatly improves adaptive binarization contrast.
+
+    Only background-like pixels (high brightness *and* high saturation) are
+    replaced; dark text pixels are left untouched so OCR engines receive clean
+    black-on-white text.
+
+    Args:
+        img: Input PIL image (any mode).
+
+    Returns:
+        PIL image with coloured backgrounds converted to white.
+    """
+    try:
+        rgb = np.array(img.convert("RGB")).astype(np.int16)
+        r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+        max_c = np.maximum(np.maximum(r, g), b)
+        min_c = np.minimum(np.minimum(r, g), b)
+        saturation = max_c - min_c          # 0 = gray, 255 = fully saturated
+        # Replace pixels that are both coloured (saturation > 30) and bright
+        # (brightness > 100), i.e. background-like pixels.
+        coloured_bg = (saturation > 30) & (max_c > 100)
+        result = rgb.copy()
+        result[coloured_bg] = [255, 255, 255]
+        return Image.fromarray(result.astype(np.uint8))
+    except Exception as exc:
+        logger.warning("remove_background_color failed: %s", exc)
+        return img
+
+
+# ─────────────────────────────────────────────────────────────────
 # Image Preprocessing
 # ─────────────────────────────────────────────────────────────────
 
@@ -964,6 +1065,10 @@ def preprocess_image(img, auto_deskew: bool = False):
         img = auto_crop_receipt(img)
         img = deskew_image(img)
 
+    # Convert coloured backgrounds to white before grayscale conversion so that
+    # e.g. the VETC app green background becomes a clean white, not a mid-grey.
+    img = remove_background_color(img)
+
     open_cv_image = np.array(img)
 
     # Convert to grayscale
@@ -984,25 +1089,19 @@ def preprocess_image(img, auto_deskew: bool = False):
     mean_brightness = np.mean(gray)
 
     if mean_brightness > _BRIGHT_THRESHOLD:
-        # Ảnh sáng (screenshot điện thoại nền trắng): sharpen để tăng độ nét chữ
-        kernel = np.array([[ 0, -1,  0],
-                            [-1,  5, -1],
-                            [ 0, -1,  0]], dtype=np.float32)
-        enhanced = cv2.filter2D(gray, -1, kernel)
-        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+        # Bright screenshot: unsharp masking for crisper character edges
+        enhanced = unsharp_mask_image(gray, sigma=1.0, strength=1.5)
         # Light denoising to remove scanner/compression artifacts
         enhanced = cv2.fastNlMeansDenoising(enhanced, h=5, templateWindowSize=7, searchWindowSize=21)
     elif mean_brightness > _BORDERLINE_BRIGHTNESS:
-        # Borderline brightness: CLAHE + gentle sharpening
+        # Borderline brightness: CLAHE + unsharp masking
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
-        kernel = np.array([[ 0, -1,  0],
-                            [-1,  5, -1],
-                            [ 0, -1,  0]], dtype=np.float32)
-        enhanced = cv2.filter2D(enhanced, -1, kernel)
-        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+        enhanced = unsharp_mask_image(enhanced, sigma=1.0, strength=1.2)
     else:
-        # Ảnh tối / scan thật: dùng CLAHE để tăng tương phản
+        # Dark/scanned image: gamma correction lifts deep shadows before CLAHE
+        if mean_brightness < 80:
+            gray = apply_gamma_correction(gray, gamma=1.8)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         enhanced = cv2.bilateralFilter(enhanced, d=7, sigmaColor=75, sigmaSpace=75)
@@ -1060,6 +1159,10 @@ def preprocess_for_easyocr(img, auto_deskew: bool = False):
         img = auto_crop_receipt(img)
         img = deskew_image(img)
 
+    # Convert coloured backgrounds to white before converting to BGR so the
+    # green (or other coloured) VETC app background becomes a clean white.
+    img = remove_background_color(img)
+
     open_cv_image = np.array(img)
 
     # Keep colour — convert to BGR for OpenCV processing
@@ -1080,16 +1183,17 @@ def preprocess_for_easyocr(img, auto_deskew: bool = False):
     mean_brightness = np.mean(gray)
 
     if mean_brightness > _BRIGHT_THRESHOLD:
-        # Light image: gentle unsharp-mask style sharpening on the colour image
-        kernel = np.array([[ 0, -1,  0],
-                            [-1,  5, -1],
-                            [ 0, -1,  0]], dtype=np.float32)
-        bgr = cv2.filter2D(bgr, -1, kernel)
-        bgr = np.clip(bgr, 0, 255).astype(np.uint8)
+        # Light image: unsharp masking applied per channel for crisper text edges
+        channels = cv2.split(bgr)
+        sharpened = [unsharp_mask_image(ch, sigma=1.0, strength=1.5) for ch in channels]
+        bgr = cv2.merge(sharpened)
     else:
-        # Dark/scanned image or borderline: enhance contrast via CLAHE on the L channel (LAB space)
+        # Dark/scanned image or borderline: CLAHE on the L channel (LAB space)
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
         l_ch, a_ch, b_ch = cv2.split(lab)
+        # Gamma correction to lift deep shadows before contrast enhancement
+        if mean_brightness < 80:
+            l_ch = apply_gamma_correction(l_ch, gamma=1.8)
         clip = 2.5 if mean_brightness > _BORDERLINE_BRIGHTNESS else 3.0
         clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
         l_ch = clahe.apply(l_ch)
@@ -1568,6 +1672,105 @@ def correct_hex_ocr(text):
     return text
 
 
+def normalize_license_plate(plate: str) -> str:
+    """Normalize a Vietnamese license plate string extracted by OCR.
+
+    Vietnamese plates follow the format:
+        NN[L][D]-NNNNN[L]
+    where:
+        NN  = 2-digit province code (11–99)
+        L   = registration-series letter (A–Z)
+        D   = optional single digit (multi-series provinces)
+        -   = separator (often mis-read as –, —, space, dot, etc.)
+        NNN = 3-5 digit serial number (may include a '.' sub-group separator)
+        L   = optional trailing check/variant letter
+
+    This function:
+    1. Normalises the dash separator to '-'.
+    2. Corrects the 2-digit province code using numeric OCR confusion rules.
+    3. Corrects the series letter (must be alpha; digit OCR errors mapped back).
+    4. Corrects the serial number portion using numeric OCR rules while
+       preserving the '.' sub-group separator and any trailing letter.
+
+    Returns the normalised plate string, or the best-effort correction if the
+    full structure cannot be parsed.
+    """
+    plate = plate.strip()
+    # Normalise dash variants to ASCII hyphen-minus '-':
+    #   U+2013 EN DASH (–), U+2014 EM DASH (—),
+    #   U+2212 MINUS SIGN (−), U+2010 HYPHEN (‐)
+    plate = re.sub(r'[–—−‐]', '-', plate)
+    # Replace a lone '.' that separates prefix from serial (no letter adjacent)
+    plate = re.sub(r'^([A-Z0-9]{2,4})[.]([0-9])', r'\1-\2', plate, flags=re.IGNORECASE)
+
+    # OCR digit ↔ letter confusion maps.
+    # Applied to the *uppercased* prefix chars:
+    _to_digit = {
+        'O': '0', 'D': '0', 'Q': '0', 'U': '0',
+        'I': '1', 'L': '1', 'J': '1',    # L covers uppercased 'l'
+        'Z': '2',
+        'S': '5',
+        'G': '6',
+        'T': '7',
+        'B': '8',
+    }
+    # Letters that OCR reads as digits (for the series-letter position)
+    _to_letter = {
+        '0': 'O', '1': 'I', '4': 'A', '5': 'S', '6': 'G', '8': 'B',
+    }
+
+    m = re.match(r'^([A-Z0-9]{2,4})\s*[-]\s*([A-Z0-9.]+)$', plate, re.IGNORECASE)
+    if not m:
+        # No recognised separator — fall back to basic correction of first 2 chars
+        if len(plate) >= 3:
+            prov = ''.join(_to_digit.get(c, c) for c in plate[:2].upper())
+            prov = re.sub(r'[^0-9]', '0', prov)
+            return prov + plate[2:]
+        return plate
+
+    prefix = m.group(1).upper()
+    # Keep suffix in its original case so correct_numeric_ocr() can use its
+    # lowercase confusion pairs (e.g. 'l' → '1') that would be lost after .upper()
+    suffix_raw = m.group(2)
+
+    # --- Province code: first 2 chars must be digits ---
+    province = ''.join(_to_digit.get(c, c) for c in prefix[:2])
+    province = re.sub(r'[^0-9]', '0', province)
+
+    # --- Series letter: 3rd char must be alpha ---
+    reg_letter = prefix[2] if len(prefix) >= 3 else ''
+    if reg_letter:
+        reg_letter = _to_letter.get(reg_letter, reg_letter)
+        if not reg_letter.isalpha():
+            reg_letter = 'A'
+
+    # --- Optional 4th char in prefix: digit (for some province series) ---
+    extra = ''
+    if len(prefix) >= 4:
+        extra_raw = prefix[3]
+        extra = _to_digit.get(extra_raw, extra_raw)
+        if not extra.isdigit():
+            extra = ''
+
+    # --- Serial number: digits with optional '.' sub-group and trailing letter ---
+    suffix = suffix_raw
+    trailing_letter = ''
+    if suffix and suffix[-1].upper().isalpha():
+        tl = suffix[-1].upper()
+        trailing_letter = _to_letter.get(tl, tl)
+        if not trailing_letter.isalpha():
+            trailing_letter = tl
+        suffix = suffix[:-1]
+
+    groups = suffix.split('.')
+    # Filter empty groups produced by consecutive/leading/trailing dots
+    corrected_groups = [correct_numeric_ocr(g) for g in groups if g]
+    serial = '.'.join(corrected_groups) + trailing_letter
+
+    new_prefix = province + reg_letter + extra
+    return f"{new_prefix}-{serial}"
+
+
 def normalize_datetime(text):
     """Chuẩn hoá chuỗi thời gian về dạng DD/MM/YYYY HH:MM:SS.
 
@@ -1873,12 +2076,9 @@ def post_process_data(data, receipt_type):
             else:
                 del data[epc_field]
 
-    # Biển số xe: 2 ký tự đầu là tỉnh (số), phần sau giữ nguyên
+    # Biển số xe: full Vietnamese plate normalisation (province code, series letter, serial)
     if "Biển số" in data:
-        bs = data["Biển số"].strip()
-        if len(bs) >= 3:
-            prefix = correct_numeric_ocr(bs[:2])
-            data["Biển số"] = prefix + bs[2:]
+        data["Biển số"] = normalize_license_plate(data["Biển số"])
         # Validate minimum plate length (Vietnamese plates: e.g. "51D-123" = 7 chars, min "29A-1" = 5)
         if len(data["Biển số"]) < _MIN_PLATE_LENGTH:
             del data["Biển số"]
